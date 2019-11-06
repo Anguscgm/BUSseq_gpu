@@ -28,6 +28,7 @@ The meaning of the arguments that can be feed into the run are as follows:
 -B    Integer, the number of batches of the input data.
 -N    String, the file name of a file containing information of the no. of samples in each batch.
       The file must contain, in order, no. of samples in batch1, no. of samples in batch2,..., etc.
+      e.g. 300 300 200 200
 -G    Integer, the number of genes in the input data.
 -K    Integer, the number subtypes (cell types) existent in the data.
       Different values can be used to search for the best fit.
