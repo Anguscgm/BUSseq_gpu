@@ -13,6 +13,7 @@ All you have to do is to download the .cu file, or clone this repository to a de
 
 ### Example
 The code can be run on a gpu with the following lines.
+After compiling for once, the executable file can be run with different arguments without compiling again.
 ```
 # Compile the CUDA code
 nvcc ./BUSseq_gpu.cu -o ./BUSseq_gpu --compiler-options -Wall
@@ -31,6 +32,7 @@ The meaning of the arguments that can be feed into the run are as follows:
       Different values can be used to search for the best fit.
 -s    Integer, this option allows user to specify the initial seed instead of letting it randomly generated everytime.
 -c    String, the file name of the input count data.
+      Please note that count data has to have the dimension N/samples (rows) x G/Genes (columns).
 -i    Integer, the total number of iterations desired.
 -b    Integer, the number of burn-in iterations desired.
 -u    Integer, the number of iterations for which p and \tau_0 will remain unchanged.
@@ -39,5 +41,14 @@ The meaning of the arguments that can be feed into the run are as follows:
 -o    String, the prefix of the output files.
 ```
 Please note that:
+- count data file (-c) has to be samples/cells(rows) x genes(columns)
 - the arguments are case-sensitive
 - unfilled arguments will be filled by the code automatically, with either preset values or calculated from your other arguments
+
+## Implementation
+The following will demonstrate how to perform BUSseq_gpu on simulation and real datasets.
+### Simulation
+```
+./BUSseq_gpu -B 4 -N ./count_data/simulation_dim.txt -G 3000 -K 5 -s 123 \
+-c ./count_data/simulation_count.txt -i 4000 -b 2000 -u 500 -p -o simulation_output
+```
