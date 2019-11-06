@@ -7,14 +7,14 @@
 #include <unistd.h>
 
 __constant__ int d_n_b[128];
-__constant__ double d_mu_nu[128]; //for b =1,...,B-1 (exclude 0)
+__constant__ double d_mu_nu[128];
 
 //Define some hyperparameters for convenience and clarity.
 #define p_init_bound 0.5
 #define tau0_init 0.005
 #define gamma0_init 0
-#define gamma1_init -0.1
-#define phi_init 5.0
+#define gamma1_init -0.3
+#define phi_init 5
 
 #define xi_pi 2
 #define sigma2_alpha 5
@@ -29,32 +29,32 @@ __constant__ double d_mu_nu[128]; //for b =1,...,B-1 (exclude 0)
 #define b_p 3
 #define a_tau0 2
 #define b_tau0 0.01
-#define tau1 50.0
+#define tau1 100.0
 
 __device__ double rgamma(curandState_t* state, double a, double scale){
     /* Constants : */
-    const static double sqrt32 = 5.656854;
-    const static double exp_m1 = 0.36787944117144232159;/* exp(-1) = 1/e */
+    const double sqrt32 = 5.656854;
+    const double exp_m1 = 0.36787944117144232159;/* exp(-1) = 1/e */
 
     /* Coefficients q[k] - for q0 = sum(q[k]*a^(-k))
      * Coefficients a[k] - for q = q0+(t*t/2)*sum(a[k]*v^k)
      * Coefficients e[k] - for exp(q)-1 = sum(e[k]*q^k)
      */
-    const static double q1 = 0.04166669;
-    const static double q2 = 0.02083148;
-    const static double q3 = 0.00801191;
-    const static double q4 = 0.00144121;
-    const static double q5 = -7.388e-5;
-    const static double q6 = 2.4511e-4;
-    const static double q7 = 2.424e-4;
+    const double q1 = 0.04166669;
+    const double q2 = 0.02083148;
+    const double q3 = 0.00801191;
+    const double q4 = 0.00144121;
+    const double q5 = -7.388e-5;
+    const double q6 = 2.4511e-4;
+    const double q7 = 2.424e-4;
 
-    const static double a1 = 0.3333333;
-    const static double a2 = -0.250003;
-    const static double a3 = 0.2000062;
-    const static double a4 = -0.1662921;
-    const static double a5 = 0.1423657;
-    const static double a6 = -0.1367177;
-    const static double a7 = 0.1233795;
+    const double a1 = 0.3333333;
+    const double a2 = -0.250003;
+    const double a3 = 0.2000062;
+    const double a4 = -0.1662921;
+    const double a5 = 0.1423657;
+    const double a6 = -0.1367177;
+    const double a7 = 0.1233795;
 
     /* State variables [FIXME for threading!] :*/
     double aa = 0.;
@@ -421,7 +421,8 @@ __global__ void first_delta_W(curandState_t* d_states, double* d_pi, int* d_sum_
     if (pos<N){
         int b = get_batch(pos);
     //W
-        double u = curand_uniform_double(&d_states[pos]);
+    
+        double u = curand_uniform_double(&d_states[pos]);        
         int k = 0;
         double temp = d_pi[b*K];
         while (u>temp){
@@ -429,6 +430,7 @@ __global__ void first_delta_W(curandState_t* d_states, double* d_pi, int* d_sum_
             temp += d_pi[b*K + k];
         }
         d_W[pos] = k;
+    
     //delta
         int ref_pos = 0;
         while (b>0){
@@ -436,6 +438,7 @@ __global__ void first_delta_W(curandState_t* d_states, double* d_pi, int* d_sum_
             ref_pos += d_n_b[b];
         }
         d_delta[pos] = log((double)d_sum_per_cell[pos]) - log((double)d_sum_per_cell[ref_pos]);
+    
     }
 }
 
@@ -636,7 +639,7 @@ __global__ void update_L(curandState_t* d_states, double* d_p, double* d_beta_sp
         //Use [pos+G] to skip k=0.
         double log_odd = log(p) - log(1-p) 
                         - (log(tau1) - log(tau0))/2.0
-                        + pow(d_beta_special[pos],2.0)*(1/tau0 - 1/tau1)/2;
+                        + pow(d_beta_special[pos],2.0)*(1/(2*tau0) - 1/(2*tau1));
         if(curand_uniform_double(&d_states[pos]) > 1/(1+exp(log_odd)))
             d_L_special[pos] = 1;
         else
@@ -709,13 +712,13 @@ __global__ void propose_nu(curandState_t* d_states, double* d_proposed_nu, doubl
         d_proposed_nu[pos] = curand_normal_double(&d_states[pos])*0.1 + d_nu_special[pos];
 }
 
-__global__ void fill_prop_nu(double* d_proposed_nu, double* d_nu, double* d_alpha, double* d_beta, double* d_delta_special, double* d_phi, 
+__global__ void fill_prop_nu(double* d_proposed_nu, double* d_nu, double* d_alpha, double* d_beta, double* d_delta, double* d_phi, 
                             int* d_W_special, int* d_X_special, double* d_temp_double, int b, int g, int G, int n_b){
     int i = threadIdx.x + blockIdx.x*blockDim.x;
     if (i < n_b){
         double new_nu = d_proposed_nu[(b-1)*G + g];
         double prev_nu = d_nu[b*G + g];
-        double mu = d_alpha[g] + d_beta[d_W_special[i]*G + g] + d_delta_special[i];//everything in mu except nu
+        double mu = d_alpha[g] + d_beta[d_W_special[i]*G + g] + d_delta[i];//everything in mu except nu
         double phi = d_phi[b*G + g];
         int X = d_X_special[i*G + g];
         d_temp_double[i] = (new_nu - prev_nu)*X
@@ -784,7 +787,8 @@ __global__ void propose_phi(curandState_t* d_states, double* d_proposed_phi, dou
 }
 
 __global__ void fill_prop_phi(double* d_proposed_phi_special, double* d_phi_special, double* d_alpha_special, double* d_beta_special,
-                            double* d_nu_special, double* d_delta_special, int* d_W_special, int* d_X_special, double* d_temp_double,  int b, int G){
+                            double* d_nu_special, double* d_delta_special, int* d_W_special, int* d_X_special, double* d_temp_double,
+                            int b, int G){
     int i = threadIdx.x + blockIdx.x*blockDim.x;
     if (i<d_n_b[b]){
         double new_phi = *d_proposed_phi_special;
@@ -806,7 +810,7 @@ __global__ void update_phi(curandState_t* d_states, double* d_proposed_phi, doub
         double prev_phi = d_phi[pos];
         double logr_phi = (kappa_phi - prev_phi)*log(new_phi)
                             - (kappa_phi - new_phi)*log(prev_phi)
-                            + (1 - tau_phi)*(prev_phi - new_phi)
+                            + (1 - tau_phi)*(new_phi - prev_phi)
                             + lgamma(prev_phi) - lgamma(new_phi);
         if (log(curand_uniform_double(&d_states[pos])) <= logr_phi + d_log_rho[pos])
             d_phi[pos] = new_phi;
@@ -919,7 +923,7 @@ __global__ void store_nu_phi(double* d_nu, double* d_preserved_nu, double* d_phi
 __global__ void store_delta_W(double* d_delta, double* d_preserved_delta, int* d_W, int* d_preserved_W, int iter, int n_preserved, int N){
     int pos = threadIdx.x + blockIdx.x*blockDim.x;
     if (pos<N){ //pos is i
-        int new_pos = pos*n_preserved + iter;
+        int new_pos= pos*n_preserved + iter;
         d_preserved_delta[new_pos] = d_delta[pos];
         d_preserved_W[new_pos] = d_W[pos];
     }
@@ -963,16 +967,16 @@ __global__ void binary_mode_on_gpu(int* d_sum, int* d_post, int length, int max)
 int main(int argc, char **argv){
     //BUSseq_gpu -b B -n n_b[0] n_b[2]...n_b[B-1] -g G -k K -c count_data.txt -iter 1000 -burn 300
     int B = 4; //Number of batches
-    int n_b[200] = {150, 150, 150, 150}; // Sample size
-    int G = 10000; //Number of genomic locations
+    int n_b[200] = {300, 300, 200, 200}; // Sample size
+    int G = 3000; //Number of genomic locations
     int K = 5; //Number of celltypes
     int seed;
-    char count_data[200] = "count_data.txt";
-    int n_iter = 2000; //Number of iterations
-    int n_burnin = 1000; //Number of burn-in iterations
+    char count_data[200] = "count_data/demo_count.txt";
+    int n_iter = 4000; //Number of iterations
+    int n_burnin = 2000; //Number of burn-in iterations
     int n_unchanged = 500;
     int print_preserved = 0; //Default: does not print all preserved iterations.
-    char output_file[200] = "busseq";
+    char output_file[200] = "demo_output";
     
     char n_file[200];
     int n_file_flag = 0;
@@ -1081,14 +1085,14 @@ int main(int argc, char **argv){
     printf("Start reading file.\n");
     FILE* myFile;
     myFile = fopen(count_data,"r");
-    char gene_names[G][32];
+    //char gene_names[G][32];
     //Array designed in the way such that the i-th sample's g-th gene is Y[i*G + g]
     int* h_Y = (int *)malloc(N * G * sizeof(int));
     int* d_Y; cudaMalloc(&d_Y, N*G*sizeof(int));
     
     //First, read in the gene names, which is the first row of the file.
-    for (int g=0; g<G; g++)
-        fscanf(myFile, "%s",  gene_names[g]);
+    //for (int g=0; g<G; g++)
+    //    fscanf(myFile, "%s",  gene_names[g]);
     //Read counts
     for (int i=0; i<N; i++)
         for (int g=0; g<G; g++)
@@ -1110,7 +1114,7 @@ int main(int argc, char **argv){
     double p[2] = {((double)rand()*p_init_bound)/RAND_MAX, tau0_init}; //p and tau0
     double* d_p; cudaMalloc(&d_p, 2*sizeof(double));
     cudaMemcpy(d_p, p, 2*sizeof(double),cudaMemcpyHostToDevice);
-    //d_tau is defined as constant memory variables.
+    //d_tau is defined as a constant.
     double* d_gamma; cudaMalloc(&d_gamma, B*2*sizeof(double)); //[0/1*B + b]
     double* d_pi; cudaMalloc(&d_pi, K*B*sizeof(double)); //[b*K + k]
     double* d_phi; cudaMalloc(&d_phi, B*G*sizeof(double));//[b*G + g]
@@ -1127,18 +1131,7 @@ int main(int argc, char **argv){
     
     double* d_mu_alpha; cudaMalloc(&d_mu_alpha, G*sizeof(double));
     double* d_mu_delta; cudaMalloc(&d_mu_delta, N*sizeof(double));
-   
-    FILE* subtypeFile;
-    subtypeFile = fopen("true_subtypes.txt","r");
-    int* h_W = (int *)malloc(N * sizeof(int));
     
-    //True subtypes for debug
-    for (int i=0; i<N; i++)
-        fscanf(subtypeFile,"%d",&h_W[i]);
-    fclose(subtypeFile);
-    cudaMemcpy(d_W, h_W, N*sizeof(int), cudaMemcpyHostToDevice);
-    free(h_W);
-   
     double* d_raw_means; cudaMalloc(&d_raw_means, B*K*G*sizeof(double));//[b*K*G + k*G + g]
     int* d_temp_int;
     if(N>n_preserved)
@@ -1184,7 +1177,6 @@ int main(int argc, char **argv){
         sample_index += n_b[b];
     }
     first_mu_nu <<<1, threads_per_block>>> (d_mean, B-1);
-    //cudaMemcpyToSymbol(d_mu_nu, &d_mean[1], (B-1)*sizeof(double), cudaMemcpyDeviceToDevice);
     double* h_mu_nu = (double*)malloc((B-1)*sizeof(double));
     cudaMemcpy(h_mu_nu, &d_mean[1], (B-1)*sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpyToSymbol(d_mu_nu, h_mu_nu, (B-1)*sizeof(double));
@@ -1214,6 +1206,7 @@ int main(int argc, char **argv){
     int* d_proposed_W; cudaMalloc(&d_proposed_W, N*sizeof(int));
     
     for (int iter=0; iter<n_burnin; iter++){
+        
         //Z and X
         update_Z_X <<<(N*G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_Y, d_W, d_alpha, d_beta, d_nu,
                         d_delta, d_gamma, d_phi,
@@ -1296,13 +1289,13 @@ int main(int argc, char **argv){
         propose_delta <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_delta, d_delta, N);
         
         sample_index = 0;
-        for (int b-0; b<B; b++){
+        for (int b=0; b<B; b++){
             for (int i=1; i<n_b[b]; i++){
                 fill_prop_delta <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_proposed_delta, d_delta, d_alpha, d_beta, d_nu, d_phi,
                                                                                     d_W, d_X, d_temp_double, sample_index+i, G);
                 sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[sample_index+i], G);
             }
-            sample_index += n_b[b]
+            sample_index += n_b[b];
         }
         update_delta <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_delta, d_log_rho, d_mu_delta, d_delta, N);
         
@@ -1359,6 +1352,7 @@ int main(int argc, char **argv){
     double* d_preserved_pi; cudaMalloc(&d_preserved_pi, B*K*n_preserved*sizeof(double));
     
     for(int iter=0; iter<n_preserved; iter++){
+        
         //Z and X
         update_Z_X <<<(N*G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_Y, d_W, d_alpha, d_beta, d_nu,
                         d_delta, d_gamma, d_phi,
@@ -1489,6 +1483,7 @@ int main(int argc, char **argv){
             //Assuming that K is less than 1024.
             update_pi <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_states, d_count, &d_pi[b*K], K);
         }
+        
         //Store iteration.
         store_gamma <<<(B*2-1)/threads_per_block + 1, threads_per_block>>> (d_gamma, d_preserved_gamma, iter, n_preserved, B*2);
         store_alpha <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_alpha, d_preserved_alpha, iter, n_preserved, G);
@@ -1566,7 +1561,7 @@ int main(int argc, char **argv){
     Z_output_file = fopen(Z_output_filename,"w");
     
     for (int i=0; i<N; i++){
-        for (int g=0; g<(G-1); g++)
+        for (int g=0; g<G-1; g++)
             fprintf(Z_output_file, "%d\t", h_post_Z[i*G + g]);
         fprintf(Z_output_file, "%d\n", h_post_Z[i*G + (G-1)]);
     }
@@ -1583,7 +1578,7 @@ int main(int argc, char **argv){
     X_output_file = fopen(X_output_filename,"w");
     
     for (int i=0; i<N; i++){
-        for (int g=0; g<(G-1); g++)
+        for (int g=0; g<G-1; g++)
             fprintf(X_output_file, "%d\t", h_post_X[i*G + g]);
         fprintf(X_output_file, "%d\n", h_post_X[i*G + (G-1)]);
     }
@@ -1631,9 +1626,6 @@ int main(int argc, char **argv){
     FILE *L_output_file;
     L_output_file = fopen(L_output_filename,"w");
     
-    for (int g=0; g<G-1; g++)
-        fprintf(L_output_file, "0.000000\t");//Directly print 0 to save time
-    fprintf(L_output_file, "0.000000\n");
     for (int k=1; k<K; k++){
         for (int g=0; g<G-1; g++)
             fprintf(L_output_file, "%lf\t", h_post_L[(k-1)*G + g]);
