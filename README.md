@@ -5,7 +5,7 @@ This is the GPU (CUDA C) version of BUSseq (Batch Effects Correction With Unknow
 The following are some simple instructions for the GPU version of BUSseq.
 
 ### Prerequisites
-BUSseq_gpu requires a working GPU accessible under the current environment, as well as the compiler `nvcc` which compilers the CUDA C code.
+BUSseq_gpu requires a working GPU accessible under the current environment, as well as the compiler `nvcc` which compiles the CUDA C code.
 
 ### Installation
 BUSseq_gpu does not require an installation.
@@ -13,7 +13,7 @@ All you have to do is to download the .cu file, or clone this repository to a de
 
 ### Example
 The code can be run on a gpu with the following lines.
-After compiling for once, the executable file can be run with different arguments without compiling again.
+Once compiled, the executable file can be run with different arguments without the need of compiling again.
 ```
 # Compile the CUDA code
 nvcc ./BUSseq_gpu.cu -o ./BUSseq_gpu --compiler-options -Wall
@@ -42,7 +42,7 @@ The meaning of the arguments that can be feed into the run are as follows:
 -o    String, the prefix of the output files.
 ```
 Please note that:
-- count data file (-c) has to be samples/cells(rows) x genes(columns)
+- the count data file (-c) has to be samples/cells(rows) x genes(columns)
 - the arguments are case-sensitive
 - unfilled arguments will be filled by the code automatically, with either preset values or calculated from your other arguments
 
