@@ -18,7 +18,8 @@ After compiling for once, the executable file can be run with different argument
 # Compile the CUDA code
 nvcc ./BUSseq_gpu.cu -o ./BUSseq_gpu --compiler-options -Wall
 # Actually running!
-./BUSseq_gpu -B 4 -N ./count_data/demo_dim.txt -G 3000 -K 5 -s 123 -c ./count_data/demo_count.txt -i 4000 -b 2000 -u 500 -p -o demo_output
+./BUSseq_gpu -B 4 -N ./count_data/demo_dim.txt -G 3000 -K 5 -s 123 \
+-c ./count_data/demo_count.txt -i 4000 -b 2000 -u 500 -p -o demo_output
 ```
 
 ### Meaning of the arguements
