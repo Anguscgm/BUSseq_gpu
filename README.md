@@ -2,7 +2,7 @@
 This is the GPU (CUDA C) version of BUSseq (Batch Effects Correction With Unknown Subtypes for scRNA-seq Data). For the C++ parallel version, please see https://github.com/songfd2018/BUSseq-1.0.
 
 ## Getting started
-The following are some simple instructions for using the GPU version of BUSseq.
+The following are some simple instructions for the GPU version of BUSseq.
 
 ### Prerequisites
 BUSseq_gpu requires a working GPU accessible under the current environment, as well as the compiler `nvcc` which compilers the CUDA C code.
