@@ -18,7 +18,7 @@ Once compiled, the executable file can be run with different arguments without t
 # Compile the CUDA code
 nvcc ./BUSseq_gpu.cu -o ./BUSseq_gpu --compiler-options -Wall
 # Actually running!
-./BUSseq_gpu -B 4 -N ./count_data/demo_dim.txt -G 3000 -K 5 -s 123 \
+./BUSseq_gpu -B 4 -N ./count_data/demo_dim.txt -G 3000 -K 5 -s 13579 \
     -c ./count_data/demo_count.txt -i 4000 -b 2000 -u 500 -o demo_output
 ```
 
@@ -52,6 +52,6 @@ Please note that:
 The following will demonstrate how to perform BUSseq_gpu on simulation and real datasets.
 ### Simulation
 ```
-./BUSseq_gpu -B 4 -N ./count_data/simulation_dim.txt -G 3000 -K 5 -s 123 \
+./BUSseq_gpu -B 4 -N ./count_data/simulation_dim.txt -G 3000 -K 5 -s 13579 \
     -c ./count_data/simulation_count.txt -i 4000 -b 2000 -u 500 -p -o simulation_output
 ```
