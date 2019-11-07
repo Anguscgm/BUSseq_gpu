@@ -19,7 +19,7 @@ Once compiled, the executable file can be run with different arguments without t
 nvcc ./BUSseq_gpu.cu -o ./BUSseq_gpu --compiler-options -Wall
 # Actually running!
 ./BUSseq_gpu -B 4 -N ./count_data/demo_dim.txt -G 3000 -K 5 -s 123 \
-    -c ./count_data/demo_count.txt -i 4000 -b 2000 -u 500 -p -o demo_output
+    -c ./count_data/demo_count.txt -i 4000 -b 2000 -u 500 -o demo_output
 ```
 
 ### Meaning of the arguements
@@ -40,6 +40,7 @@ The meaning of the arguments that can be feed into the run are as follows:
 -u    Integer, the number of iterations for which p and \tau_0 will remain unchanged.
 -p    N/A, no further argument required.
       This is a flag that prints all the preserved iterations on top of posterior samples.
+      Default is not printing.
 -o    String, the prefix of the output files.
 ```
 Please note that:
