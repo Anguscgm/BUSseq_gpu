@@ -964,6 +964,65 @@ __global__ void binary_mode_on_gpu(int* d_sum, int* d_post, int length, int max)
         d_post[pos] = (d_sum[pos]*2>max);
 }
 
+__global__ void fill_log_likelihood_1(double* d_alpha, double* d_beta_special, double* d_nu_special, double* d_delta_special,
+                                    double* d_gamma_0, double* d_gamma_1, double* d_phi_special,
+                                    int* d_Y_special, double* d_temp_double, int G){
+    int g = threadIdx.x + blockIdx.x*blockDim.x;
+    if (g < G){
+        double mu = exp(d_alpha[g] + d_beta_special[g] + d_nu_special[g] + *d_delta_special);
+        double phi = d_phi_special[g];
+        int Y = d_Y_special[g];
+        double pbgk = mu/(mu + phi);
+        double logp, log1mp;
+        if (pbgk < exp(-250.0)){
+            logp = -250;
+            log1mp = log(1-pbgk);
+        }else if (1-pbgk < exp(-250.0)){
+            logp = log(pbgk);
+            log1mp = -250;
+        }else{
+            logp = log(pbgk);
+            log1mp = log(1-pbgk);
+        }
+        if (Y){
+            d_temp_double[g] = - log(1 + exp(*d_gamma_0 + *d_gamma_1*Y))
+                    + lgamma(phi + Y) - lgamma((double)1+Y) - lgamma(phi)
+                    + Y * logp + phi * log1mp;
+        }else{
+            int x_max = (int)3 * mu; //basically a floor function
+            double sum_lr0 = phi * log1mp;
+            for (int x=1; x<x_max; x++){
+                double temp = *d_gamma_0 + *d_gamma_1 * x
+                            - log(1 + exp(*d_gamma_0 + *d_gamma_1*x))
+                            + lgamma(phi + x) - lgamma((double)1+x) - lgamma(phi)
+                            + x * logp + phi * log1mp;
+                if(temp > sum_lr0)
+                    sum_lr0 = temp + log(1 + exp(sum_lr0 - temp));
+                else
+                    sum_lr0 += log(1 + exp(temp - sum_lr0));
+            }
+            d_temp_double[g] = sum_lr0;
+        }
+    }
+}
+
+__global__ void fill_log_likelihood_2(double* d_pi, double* d_log_likelihood_partial, double* d_temp_double, int N, int K){
+    int i = threadIdx.x + blockIdx.x*blockDim.x;
+    if (i<N){
+        int b = get_batch(i);
+        double sum = 0;
+        double max = d_log_likelihood_partial[i];
+        for (int k=1; k<K; k++){
+            if (d_log_likelihood_partial[k*N + i] > max)
+                max = d_log_likelihood_partial[k*N + i];
+        }
+        for (int k=0; k<K; k++){
+            sum += d_pi[b*K + k] * exp(d_log_likelihood_partial[k*N + i] - max);
+        }
+        d_temp_double[i] = max + log(sum);
+    }
+}
+
 int main(int argc, char **argv){
     //BUSseq_gpu -b B -n n_b[0] n_b[2]...n_b[B-1] -g G -k K -c count_data.txt -iter 1000 -burn 300
     int B = 4; //Number of batches
@@ -1752,6 +1811,36 @@ int main(int argc, char **argv){
     }
     fclose(pi_output_file);
     free(h_post_pi);
+    
+    //BIC
+    double* d_log_likelihood_partial; cudaMalloc(&d_log_likelihood_partial, N*K*sizeof(double));//k*N + i
+    sample_index = 0;
+    for (int b=0; b<B; b++){
+        for (int i=0; i<n_b[b]; i++){
+            for (int k=0; k<K; k++){
+                fill_log_likelihood_1<<<(G-1)/threads_per_block + 1, threads_per_block>>>(d_alpha, &d_beta[k*G], &d_nu[b*G], &d_delta[sample_index+i],
+                                        &d_gamma[b], &d_gamma[B+b], &d_phi[b*G], &d_Y[(sample_index+i)*G], d_temp_double, G);
+                sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>>(d_temp_double, &d_log_likelihood_partial[k*N + sample_index + i], G);
+            }
+        }
+        sample_index += n_b[b];
+    }
+    
+    fill_log_likelihood_2 <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_pi, d_log_likelihood_partial, d_temp_double, N, K);
+    sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, d_temp_double, N);
+    double log_likelihood;
+    cudaMemcpy(&log_likelihood, d_temp_double, sizeof(double), cudaMemcpyDeviceToHost);
+    double BIC = -2*log_likelihood + log(G*N)*((B+G)*K + 2*B + G*(B*2 - 1) + N - B);
+
+    char BIC_output_filename[200];
+    strcpy(BIC_output_filename, output_file);
+    strcat(BIC_output_filename, "_BIC.txt");
+    FILE *BIC_output_file;
+    BIC_output_file = fopen(BIC_output_filename,"w");
+    
+    fprintf(BIC_output_file, "%lf\n", BIC);
+    
+    fclose(BIC_output_file);
     
     //(Optional) Print out all preserved iterations.
     if (print_preserved){
