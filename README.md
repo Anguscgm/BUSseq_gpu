@@ -36,6 +36,9 @@ Once compiled, the executable file can be run with different arguments without t
     Inside demo_dropout.txt is:
     1 1 1 1
     
+    The write-out-iterations option (-w) is activated with argument 1000.
+    This means that for the 2000 preserved iterations, they will be stored temporarily every 1000 iterations.
+    
 ### Meaning of the arguements
 The meaning of the arguments that can be feed into the run are as follows:
 ```
