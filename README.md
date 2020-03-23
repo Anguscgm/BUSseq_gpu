@@ -86,5 +86,5 @@ The following will demonstrate how to perform BUSseq_gpu on simulation and real 
     Inside demo_dropout.txt is:
     1 1 1 1
 
-##Contact
+## Contact
 If you have any questions, please feel free to contact me via email (chan.ga.ming.angus@gmail.com) or leave an issue under this repository.
