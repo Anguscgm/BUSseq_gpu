@@ -22,22 +22,22 @@ Once compiled, the executable file can be run with different arguments without t
 ```
 # Compile the CUDA code
     nvcc ./gpu_busseq_optional_dropout.cu -o ./gpu_busseq_optional_dropout --compiler-options -Wall
-    # Actually running!
+# Actually running!
     ./gpu_busseq_optional_dropout -B 4 -N ./count_data/demo_dim.txt -G 3000 -K 5 -s 13579 \
         -c ./count_data/demo_count.txt -i 4000 -b 2000 -u 500 -w 1000 \
         -d ./count_data/demo_dropout.txt -o demo_output
 ```
-    Inside demo_dim.txt is:
+Inside demo_dim.txt is:
     300 300 200 200
 
-    Inside demo_count.txt is:
+Inside demo_count.txt is:
     count data N x G, without row and column names.
 
-    Inside demo_dropout.txt is:
+Inside demo_dropout.txt is:
     1 1 1 1
     
-    The write-out-iterations option (-w) is activated with argument 1000.
-    This means that for the 2000 preserved iterations, they will be stored temporarily every 1000 iterations.
+The write-out-iterations option (-w) is activated with argument 1000.
+This means that for the 2000 preserved iterations, they will be stored temporarily every 1000 iterations.
     
 ### Meaning of the arguements
 The meaning of the arguments that can be feed into the run are as follows:
