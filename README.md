@@ -27,7 +27,15 @@ Once compiled, the executable file can be run with different arguments without t
         -c ./count_data/demo_count.txt -i 4000 -b 2000 -u 500 -w 1000 \
         -d ./count_data/demo_dropout.txt -o demo_output
 ```
+    Inside demo_dim.txt is:
+    300 300 200 200
 
+    Inside demo_count.txt is:
+    count data N x G, without row and column names.
+
+    Inside demo_dropout.txt is:
+    1 1 1 1
+    
 ### Meaning of the arguements
 The meaning of the arguments that can be feed into the run are as follows:
 ```
@@ -73,18 +81,10 @@ Please note that:
 The following will demonstrate how to perform BUSseq_gpu on simulation and real datasets.
 ### Simulation
 ```
-/gpu_busseq_optional_dropout -B 4 -N ./count_data/demo_dim.txt -G 3000 -K 5 -s 13579 \
-        -c ./count_data/demo_count.txt -i 4000 -b 2000 -u 500 \
-        -d ./count_data/demo_dropout.txt -o simulation_output
+/gpu_busseq_optional_dropout -B 4 -N ./count_data/simulation_dim.txt -G 3000 -K 5 -s 13579 \
+        -c ./count_data/simulation_count.txt -i 4000 -b 2000 -u 500 \
+        -d ./count_data/simulation_dropout.txt -o simulation_output
 ```
-    Inside demo_dim.txt is:
-    300 300 200 200
-
-    Inside demo_count.txt is:
-    count data N x G, without row and column names.
-
-    Inside demo_dropout.txt is:
-    1 1 1 1
 
 ## Contact
 If you have any questions, please feel free to contact me via email (chan.ga.ming.angus@gmail.com) or leave an issue under this repository.
