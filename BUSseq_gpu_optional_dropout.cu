@@ -483,18 +483,18 @@ __global__ void first_mu_nu(double* d_mean, int bound){
 
 __global__ void update_Z_X(curandState_t* d_states, int* d_Y, int* d_W, double* d_alpha, double* d_beta, double* d_nu,
                         double* d_delta, double* d_gamma, double* d_phi,
-                        int* d_Z, int* d_X, int B, int N, int G){
+                        int* d_Z, int* d_X, int* d_batch_dropout, int B, int N, int G){
     int pos = threadIdx.x + blockIdx.x*blockDim.x;
     if (pos<N*G){ //pos is i*G + g
         curandState_t thread_state = d_states[pos];
         int i = pos/G;
         int b = get_batch(i);
-        if(d_Y[pos] == 0){
-            if(d_X[pos] == 0)
+        if(!d_Y[pos] && d_batch_dropout[b]){
+            if(!d_X[pos])
                 d_Z[pos] = (curand_uniform_double(&thread_state)>1/(1+exp(d_gamma[b])));
             else
                 d_Z[pos] = 1;
-            if(d_Z[pos] == 1){
+            if(d_Z[pos]){
                 int g = pos - i*G;
                 int k = d_W[i];
                 double log_mu = d_alpha[g] + d_beta[k*G+g] + d_nu[b*G + g] + d_delta[i];
@@ -511,9 +511,9 @@ __global__ void update_Z_X(curandState_t* d_states, int* d_Y, int* d_W, double* 
     }
 }
 
-__global__ void propose_gamma(curandState_t* d_states, double* d_proposed_gamma, double* d_gamma,int B){
+__global__ void propose_gamma(curandState_t* d_states, double* d_proposed_gamma, double* d_gamma, int* d_batch_dropout, int B){
     int b = threadIdx.x + blockIdx.x*blockDim.x;
-    if(b<B){
+    if(b<B && d_batch_dropout[b]){
         curandState_t thread_state = d_states[b];
         d_proposed_gamma[b] = curand_normal_double(&thread_state)*0.1 + d_gamma[b];
         d_proposed_gamma[B+b] = -rgamma(&thread_state, -10*d_gamma[B+b],0.1);
@@ -575,9 +575,9 @@ __global__ void fill_prop_gamma1(double* d_proposed_gamma, double* d_gamma, int*
     }
 }
 
-__global__ void update_gamma0(curandState_t* d_states, double* d_proposed_gamma, double* d_log_rho, double* d_gamma, int B){
+__global__ void update_gamma0(curandState_t* d_states, double* d_proposed_gamma, double* d_log_rho, int* d_batch_dropout, double* d_gamma, int B){
     int b = threadIdx.x + blockIdx.x*blockDim.x;
-    if(b<B){
+    if(b<B && d_batch_dropout[b]){
         double logr_gamma0_prior = (pow(d_gamma[b], 2.0) - pow(d_proposed_gamma[b],2.0))/(2*sigma2_gamma0);
         
         if (log(curand_uniform_double(&d_states[b])) <= (logr_gamma0_prior + d_log_rho[b]))
@@ -585,9 +585,9 @@ __global__ void update_gamma0(curandState_t* d_states, double* d_proposed_gamma,
     }
 }
 
-__global__ void update_gamma1(curandState_t* d_states, double* d_proposed_gamma, double* d_log_rho, double* d_gamma, int B){
+__global__ void update_gamma1(curandState_t* d_states, double* d_proposed_gamma, double* d_log_rho, int* d_batch_dropout, double* d_gamma, int B){
     int b = threadIdx.x + blockIdx.x*blockDim.x;
-    if(b<B){
+    if(b<B && d_batch_dropout[b]){
         double prev_gamma1 = -d_gamma[B+b];
         double new_gamma1 = -d_proposed_gamma[B+b];
         double logr_gamma1 = (kappa_gamma1 - 1)*(log(new_gamma1) - log(prev_gamma1))
@@ -966,7 +966,7 @@ __global__ void binary_mode_on_gpu(int* d_sum, int* d_post, int length, int max)
 
 __global__ void fill_log_likelihood_1(double* d_alpha, double* d_beta_special, double* d_nu_special, double* d_delta_special,
                                     double* d_gamma_0, double* d_gamma_1, double* d_phi_special,
-                                    int* d_Y_special, double* d_temp_double, int G){
+                                    int* d_Y_special, int dropout, double* d_temp_double, int G){
     int g = threadIdx.x + blockIdx.x*blockDim.x;
     if (g < G){
         double mu = exp(d_alpha[g] + d_beta_special[g] + d_nu_special[g] + *d_delta_special);
@@ -984,8 +984,11 @@ __global__ void fill_log_likelihood_1(double* d_alpha, double* d_beta_special, d
             logp = log(pbgk);
             log1mp = log(1-pbgk);
         }
-        if (Y){
-            d_temp_double[g] = - log(1 + exp(*d_gamma_0 + *d_gamma_1*Y))
+        if(!dropout){
+            d_temp_double[g] = lgamma(phi + Y) - lgamma((double)1+Y) - lgamma(phi)
+                    + Y * logp + phi * log1mp;
+        }else if (Y){
+            d_temp_double[g] = - log(1+exp(*d_gamma_0 + *d_gamma_1*Y))
                     + lgamma(phi + Y) - lgamma((double)1+Y) - lgamma(phi)
                     + Y * logp + phi * log1mp;
         }else{
@@ -1034,18 +1037,24 @@ int main(int argc, char **argv){
     int n_iter = 4000; //Number of iterations
     int n_burnin = 2000; //Number of burn-in iterations
     int n_unchanged = 500;
+    int n_ram = 16;//The RAM size in Gb.
+    int n_write_disk = 0;
+    int batch_dropout[200]; //1 is allow dropout while 0 is NOT
     int print_preserved = 0; //Default: does not print all preserved iterations.
-    char output_file[200] = "demo_output";
+    char output_file[200] = "optional_dropout_output";
     
     char n_file[200];
     int n_file_flag = 0;
     int burnin_flag = 1;
     int unchanged_flag = 1;
+    int cal_n_write_disk = 1;
     int seed_flag = 1;
+    char batch_dropout_file[200];
+    int batch_dropout_file_flag = 0;
     
     int opt;
     
-    while ((opt = getopt (argc, argv, "B:N:G:K:s:c:i:b:u:po:")) != -1){
+    while ((opt = getopt (argc, argv, "B:N:G:K:s:c:i:b:u:r:w:d:po:")) != -1){
         switch(opt){
             case 'B':
                 B = atoi(optarg);
@@ -1078,6 +1087,17 @@ int main(int argc, char **argv){
                 unchanged_flag = 0;
                 n_unchanged = atoi(optarg);
                 break;
+            case 'r':
+                n_ram = atoi(optarg);
+                break;
+            case 'w':
+                cal_n_write_disk = 0;
+                n_write_disk = atoi(optarg);
+                break;
+            case 'd':
+                batch_dropout_file_flag = 1;
+                strcpy(batch_dropout_file, optarg);
+                break;
             case 'p':
                 print_preserved = 1;
                 break;
@@ -1109,6 +1129,22 @@ int main(int argc, char **argv){
                 n_unchanged = 500;
         }
     }
+    
+    //Optional dropout
+    if (batch_dropout_file_flag){
+        FILE* dropout_file;
+        dropout_file = fopen(batch_dropout_file, "r");
+        for (int b=0; b<B; b++)
+            fscanf(dropout_file, "%d", &batch_dropout[b]);
+        fclose(dropout_file);
+    }
+    else{
+        for (int b=0; b<B; b++)
+            batch_dropout[b] = 1;
+    }
+    int* d_batch_dropout; cudaMalloc(&d_batch_dropout, B*sizeof(int));
+    cudaMemcpy(d_batch_dropout, batch_dropout, B*sizeof(int), cudaMemcpyHostToDevice);
+    
     // Get seed
     if (seed_flag){
         struct timeval currentTime;
@@ -1139,6 +1175,22 @@ int main(int argc, char **argv){
     cudaMemcpyToSymbol(d_n_b, n_b, B*sizeof(int));
     int n_preserved = n_iter - n_burnin;
     int threads_per_block = 1024;
+
+    if (cal_n_write_disk){
+        //Calculate how many iterations per which to write to disk.
+        n_write_disk = n_ram*1000000 / ((N*3 + G*(3*K + 2*B))/1024/4); //This is a rough approximation which underestimates n_write_disk for safety.
+    }
+
+    // Check if it is necessary to write temporary files.
+    int boo_write_disk = 0;
+    if (n_write_disk != 0)
+        boo_write_disk= (n_preserved > n_write_disk);
+    int n_write_disk_times;
+    if (boo_write_disk){
+        n_write_disk_times = (n_preserved - 1)/n_write_disk + 1;
+        n_preserved = (n_preserved - 1)/n_write_disk_times + 1; //This is to save the trouble of uneven averaging.
+    }
+    printf("n_preserved is %d, n_write_disk_times is %d, n_write_disk is %d, boo_write_disk is %d.\n", n_preserved, n_write_disk_times, n_write_disk, boo_write_disk);
     
     //Read file.
     printf("Start reading file.\n");
@@ -1198,7 +1250,11 @@ int main(int argc, char **argv){
     else
         cudaMalloc(&d_temp_int, n_preserved*sizeof(int));
     double* d_temp_double; cudaMalloc(&d_temp_double, N*G*sizeof(double));
-    int* d_count; cudaMalloc(&d_count, K*N*sizeof(int));
+    int* d_count;
+    if(boo_write_disk)
+        cudaMalloc(&d_count, K*N*n_write_disk_times*sizeof(int));
+    else
+        cudaMalloc(&d_count, K*N*sizeof(int));
     double* d_mean; cudaMalloc(&d_mean, B*sizeof(double));
     
     for(int i=0; i<N; i++)
@@ -1269,32 +1325,36 @@ int main(int argc, char **argv){
         //Z and X
         update_Z_X <<<(N*G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_Y, d_W, d_alpha, d_beta, d_nu,
                         d_delta, d_gamma, d_phi,
-                        d_Z, d_X, B, N, G);//If there are not enough threads, may have to separate Z and X.
-        
+                        d_Z, d_X, d_batch_dropout, B, N, G);//If there are not enough threads, may have to separate Z and X.
+    
         // gamma
-        propose_gamma <<<(B-1)/threads_per_block + 1, threads_per_block>>>(d_states, d_proposed_gamma, d_gamma,B);
+        propose_gamma <<<(B-1)/threads_per_block + 1, threads_per_block>>>(d_states, d_proposed_gamma, d_gamma, d_batch_dropout, B);
         
         //Fill gamma0
         sample_index = 0;
         for (int b=0; b<B; b++){
             if (b>0)
                 sample_index += n_b[b-1];
-            fill_prop_gamma0 <<<(n_b[b]*G-1)/threads_per_block+1, threads_per_block>>> (d_proposed_gamma, d_gamma, &d_Z[sample_index*G],
-                                                                                        &d_X[sample_index*G], d_temp_double, b, B, n_b[b]*G);
-            sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[b], n_b[b]*G);
+            if (batch_dropout[b]){
+                fill_prop_gamma0 <<<(n_b[b]*G-1)/threads_per_block+1, threads_per_block>>> (d_proposed_gamma, d_gamma, &d_Z[sample_index*G],
+                                                                                            &d_X[sample_index*G], d_temp_double, b, B, n_b[b]*G);
+                sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[b], n_b[b]*G);
+            }
         }
-        update_gamma0 <<< (B-1)/threads_per_block + 1, threads_per_block >>> (d_states, d_proposed_gamma, d_log_rho, d_gamma, B);
+        update_gamma0 <<< (B-1)/threads_per_block + 1, threads_per_block >>> (d_states, d_proposed_gamma, d_log_rho, d_batch_dropout, d_gamma, B);
         
         //Fill gamma1
         sample_index = 0;
         for (int b=0; b<B; b++){
             if (b>0)
                 sample_index += n_b[b-1];
-            fill_prop_gamma1 <<<(n_b[b]*G-1)/threads_per_block+1, threads_per_block>>> (d_proposed_gamma, d_gamma, &d_Z[sample_index*G],
-                                                                                        &d_X[sample_index*G], d_temp_double, b, B, n_b[b]*G);
-            sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[b], n_b[b]*G);
+            if (batch_dropout[b]){
+                fill_prop_gamma1 <<<(n_b[b]*G-1)/threads_per_block+1, threads_per_block>>> (d_proposed_gamma, d_gamma, &d_Z[sample_index*G],
+                                                                                            &d_X[sample_index*G], d_temp_double, b, B, n_b[b]*G);
+                sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[b], n_b[b]*G);
+            }
         }
-        update_gamma1 <<< (B-1)/threads_per_block + 1, threads_per_block >>> (d_states, d_proposed_gamma, d_log_rho, d_gamma, B);
+        update_gamma1 <<< (B-1)/threads_per_block + 1, threads_per_block >>> (d_states, d_proposed_gamma, d_log_rho, d_batch_dropout, d_gamma, B);
         
         //alpha
         propose_alpha <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_alpha, d_alpha, G);
@@ -1396,7 +1456,9 @@ int main(int argc, char **argv){
             //Assuming that K is less than 1024.
             update_pi <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_states, d_count, &d_pi[b*K], K);
         }
+        
     }
+    
     printf("Burnin completed. Start recording iterations.\n");
     //Declare stored iterations.
     double* d_preserved_gamma; cudaMalloc(&d_preserved_gamma, B*2*n_preserved*sizeof(double));
@@ -1410,202 +1472,797 @@ int main(int argc, char **argv){
     int* d_preserved_W; cudaMalloc(&d_preserved_W, N*n_preserved*sizeof(int));
     double* d_preserved_pi; cudaMalloc(&d_preserved_pi, B*K*n_preserved*sizeof(double));
     
-    for(int iter=0; iter<n_preserved; iter++){
+    double* d_post_prob; cudaMalloc(&d_post_prob, G*(K-1)*sizeof(double));
+    
+    if(!boo_write_disk){
+        for(int iter=0; iter<n_preserved; iter++){
+            
+            //Z and X
+            update_Z_X <<<(N*G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_Y, d_W, d_alpha, d_beta, d_nu,
+                            d_delta, d_gamma, d_phi,
+                            d_Z, d_X, d_batch_dropout, B, N, G);//If there are not enough threads, may have to separate Z and X.
         
-        //Z and X
-        update_Z_X <<<(N*G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_Y, d_W, d_alpha, d_beta, d_nu,
-                        d_delta, d_gamma, d_phi,
-                        d_Z, d_X, B, N, G);//If there are not enough threads, may have to separate Z and X.
-        
-        // gamma
-        propose_gamma <<<(B-1)/threads_per_block + 1, threads_per_block>>>(d_states, d_proposed_gamma, d_gamma,B);
-        
-        //Fill gamma0
-        sample_index = 0;
-        for (int b=0; b<B; b++){
-            if (b>0)
+            // gamma
+            propose_gamma <<<(B-1)/threads_per_block + 1, threads_per_block>>>(d_states, d_proposed_gamma, d_gamma, d_batch_dropout, B);
+            
+            //Fill gamma0
+            sample_index = 0;
+            for (int b=0; b<B; b++){
+                if (b>0)
+                    sample_index += n_b[b-1];
+                if (batch_dropout[b]){
+                    fill_prop_gamma0 <<<(n_b[b]*G-1)/threads_per_block+1, threads_per_block>>> (d_proposed_gamma, d_gamma, &d_Z[sample_index*G],
+                                                                                                &d_X[sample_index*G], d_temp_double, b, B, n_b[b]*G);
+                    sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[b], n_b[b]*G);
+                }
+            }
+            update_gamma0 <<< (B-1)/threads_per_block + 1, threads_per_block >>> (d_states, d_proposed_gamma, d_log_rho, d_batch_dropout, d_gamma, B);
+            
+            //Fill gamma1
+            sample_index = 0;
+            for (int b=0; b<B; b++){
+                if (b>0)
+                    sample_index += n_b[b-1];
+                if (batch_dropout[b]){
+                    fill_prop_gamma1 <<<(n_b[b]*G-1)/threads_per_block+1, threads_per_block>>> (d_proposed_gamma, d_gamma, &d_Z[sample_index*G],
+                                                                                                &d_X[sample_index*G], d_temp_double, b, B, n_b[b]*G);
+                    sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[b], n_b[b]*G);
+                }
+            }
+            update_gamma1 <<< (B-1)/threads_per_block + 1, threads_per_block >>> (d_states, d_proposed_gamma, d_log_rho, d_batch_dropout, d_gamma, B);
+            
+            //alpha
+            propose_alpha <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_alpha, d_alpha, G);
+            
+            for (int g=0; g<G; g++){
+                fill_prop_alpha <<< (N-1)/threads_per_block + 1, threads_per_block >>>(d_proposed_alpha, d_alpha, d_beta, d_nu, d_delta, d_phi,
+                                                                                    d_W, d_X, d_temp_double, g, B, N, G);
+                sum_on_gpu <double> <<< 1, threads_per_block, threads_per_block*sizeof(double) >>>(d_temp_double, &d_log_rho[g], N);
+            }
+            update_alpha <<< (G-1)/threads_per_block + 1, threads_per_block >>>(d_states, d_proposed_alpha, d_log_rho, d_mu_alpha, d_alpha, G);
+            
+            //L
+            update_L <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_p, &d_beta[G], &d_L[G], G*(K-1));
+            
+            //p
+            if(iter >= n_unchanged - n_burnin){
+                //Fill d_count[0] with sum of d_L and d_p[1] with sum of I(d_L==0)*d_beta^2
+                //I used d_p[1] to carry the second sum. Its value will be replaced anyway.
+                sum_on_gpu <int> <<<1, threads_per_block, threads_per_block*sizeof(int)>>> (&d_L[G], &d_count[0], G*(K-1));
+                fill_I_L_beta_sq <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>> (&d_L[G], &d_beta[G], d_temp_double, G*(K-1));
+                sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_p[1], G*(K-1));
+                update_p <<<1,1>>> (d_states, d_count, d_p, G, K);
+                update_tau0 <<<1,1>>> (d_states, d_count, d_p, G, K);
+            }
+            
+            //beta
+            propose_beta <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_beta, &d_beta[G], G*(K-1));
+            for (int k=1; k<K; k++){
+                for (int g=0; g<G; g++){
+                    fill_prop_beta <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_proposed_beta, d_beta, d_alpha, d_nu, d_delta,
+                                                                                    d_phi, d_W, d_X, d_temp_double, g, k, N, G);
+                    sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>>(d_temp_double, &d_log_rho[(k-1)*G + g], N);
+                }
+            }
+            update_beta <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_beta, d_log_rho, &d_L[G], &d_beta[G], d_p, G*(K-1));
+            
+            //nu
+            propose_nu <<<(G*(B-1)-1)/threads_per_block + 1, threads_per_block>>>(d_states, d_proposed_nu, &d_nu[G], G*(B-1));
+            sample_index = 0;
+            for (int b=1; b<B; b++){
                 sample_index += n_b[b-1];
-            fill_prop_gamma0 <<<(n_b[b]*G-1)/threads_per_block+1, threads_per_block>>> (d_proposed_gamma, d_gamma, &d_Z[sample_index*G],
-                                                                                        &d_X[sample_index*G], d_temp_double, b, B, n_b[b]*G);
-            sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[b], n_b[b]*G);
+                for (int g=0; g<G; g++){
+                    fill_prop_nu <<<(n_b[b]-1)/threads_per_block + 1, threads_per_block>>>(d_proposed_nu, d_nu, d_alpha, d_beta, &d_delta[sample_index], d_phi, &d_W[sample_index],
+                                                                                            &d_X[sample_index*G], d_temp_double, b, g, G, n_b[b]);
+                    sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[(b-1)*G + g], n_b[b]);
+                }
+            }
+            update_nu <<<(G*(B-1)-1)/threads_per_block+1, threads_per_block>>> (d_states, d_proposed_nu, d_log_rho, &d_nu[G], G, G*(B-1));
+            
+            //delta
+            propose_delta <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_delta, d_delta, N);
+            
+            sample_index = 0;
+            for (int b=0; b<B; b++){
+                for (int i=1; i<n_b[b]; i++){
+                    fill_prop_delta <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_proposed_delta, d_delta, d_alpha, d_beta, d_nu, d_phi,
+                                                                                        d_W, d_X, d_temp_double, sample_index+i, G);
+                    sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[sample_index+i], G);
+                }
+                sample_index += n_b[b];
+            }
+            update_delta <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_delta, d_log_rho, d_mu_delta, d_delta, N);
+            
+            //phi
+            propose_phi <<<(B*G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_phi, d_phi, B*G);
+            sample_index = 0;
+            int bg = 0;
+            for (int b=0; b<B; b++){
+                if(b>0)
+                    sample_index += n_b[b-1];
+                for (int g=0; g<G; g++){
+                    fill_prop_phi <<<(n_b[b]-1)/threads_per_block + 1, threads_per_block>>> (&d_proposed_phi[bg], &d_phi[bg], &d_alpha[g], &d_beta[g], &d_nu[bg],
+                                                                                            &d_delta[sample_index], &d_W[sample_index], &d_X[sample_index*G + g], d_temp_double, b, G);
+                    sum_on_gpu <double> <<<1, threads_per_block , threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[bg], n_b[b]);
+                    bg++;
+                }
+            }
+            update_phi <<<(B*G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_phi, d_log_rho, d_phi, B*G);
+            
+            //w
+            propose_W <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_W, N, K);
+            
+            for (int i=0; i<N; i++){
+                fill_prop_W <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_proposed_W, d_W, d_alpha, d_beta, d_nu, d_delta,
+                                                                                d_phi, d_X, d_temp_double, i, G);
+                sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[i], G);
+            }
+            update_W <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_W, d_log_rho, d_pi, d_W, N, K);
+            
+            //pi
+            sample_index = 0;
+            for (int b=0; b<B; b++){
+                if(b>0)
+                    sample_index += n_b[b-1];
+                for (int k=0; k<K; k++){
+                    fill_I_W <<<(n_b[b]-1)/threads_per_block + 1, threads_per_block>>> (&d_W[sample_index], d_temp_int, k, n_b[b]);
+                    sum_on_gpu <int> <<<1, threads_per_block, threads_per_block*sizeof(int)>>> (d_temp_int, &d_count[k], n_b[b]);
+                }
+                //Assuming that K is less than 1024.
+                update_pi <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_states, d_count, &d_pi[b*K], K);
+            }
+            
+            //Store iteration.
+            store_gamma <<<(B*2-1)/threads_per_block + 1, threads_per_block>>> (d_gamma, d_preserved_gamma, iter, n_preserved, B*2);
+            store_alpha <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_alpha, d_preserved_alpha, iter, n_preserved, G);
+            store_L_beta <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>>(&d_L[G], d_preserved_L, &d_beta[G], d_preserved_beta, iter, n_preserved, G*(K-1));
+            cudaMemcpy(&d_preserved_p[iter], &d_p[0], sizeof(double), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(&d_preserved_p[n_preserved + iter], &d_p[1], sizeof(double), cudaMemcpyDeviceToDevice);
+            store_nu_phi <<<(B*G-1)/threads_per_block + 1, threads_per_block>>> (d_nu, d_preserved_nu, d_phi, d_preserved_phi, iter, n_preserved, G, B*G);
+            store_delta_W <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_delta, d_preserved_delta, d_W, d_preserved_W, iter, n_preserved, N);
+            store_pi <<<(B*K-1)/threads_per_block + 1, threads_per_block>>> (d_pi, d_preserved_pi, iter, n_preserved, B*K);
         }
-        update_gamma0 <<< (B-1)/threads_per_block + 1, threads_per_block >>> (d_states, d_proposed_gamma, d_log_rho, d_gamma, B);
         
-        //Fill gamma1
-        sample_index = 0;
-        for (int b=0; b<B; b++){
-            if (b>0)
-                sample_index += n_b[b-1];
-            fill_prop_gamma1 <<<(n_b[b]*G-1)/threads_per_block+1, threads_per_block>>> (d_proposed_gamma, d_gamma, &d_Z[sample_index*G],
-                                                                                        &d_X[sample_index*G], d_temp_double, b, B, n_b[b]*G);
-            sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[b], n_b[b]*G);
-        }
-        update_gamma1 <<< (B-1)/threads_per_block + 1, threads_per_block >>> (d_states, d_proposed_gamma, d_log_rho, d_gamma, B);
+        //3.Posterior Inference
+        printf("Start posterior inference.\n");
+        //reuse d_{sth} as d_post_{sth}
+        //Z
+        // Not necessary
+        //X
+        // Not necessary either
+        //gamma
+        for (int b=0; b<2*B; b++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_gamma[b*n_preserved], &d_gamma[b], n_preserved);
         
         //alpha
-        propose_alpha <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_alpha, d_alpha, G);
-        
-        for (int g=0; g<G; g++){
-            fill_prop_alpha <<< (N-1)/threads_per_block + 1, threads_per_block >>>(d_proposed_alpha, d_alpha, d_beta, d_nu, d_delta, d_phi,
-                                                                                d_W, d_X, d_temp_double, g, B, N, G);
-            sum_on_gpu <double> <<< 1, threads_per_block, threads_per_block*sizeof(double) >>>(d_temp_double, &d_log_rho[g], N);
-        }
-        update_alpha <<< (G-1)/threads_per_block + 1, threads_per_block >>>(d_states, d_proposed_alpha, d_log_rho, d_mu_alpha, d_alpha, G);
+        for (int g=0; g<G; g++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_alpha[g*n_preserved], &d_alpha[g], n_preserved);
         
         //L
-        update_L <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_p, &d_beta[G], &d_L[G], G*(K-1));
+        for (int pos=0; pos<G*(K-1); pos++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(int)>>> (&d_preserved_L[pos*n_preserved], &d_post_prob[pos], n_preserved);
         
-        //p
-        if(iter >= n_unchanged - n_burnin){
-            //Fill d_count[0] with sum of d_L and d_p[1] with sum of I(d_L==0)*d_beta^2
-            //I used d_p[1] to carry the second sum. Its value will be replaced anyway.
-            sum_on_gpu <int> <<<1, threads_per_block, threads_per_block*sizeof(int)>>> (&d_L[G], &d_count[0], G*(K-1));
-            fill_I_L_beta_sq <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>> (&d_L[G], &d_beta[G], d_temp_double, G*(K-1));
-            sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_p[1], G*(K-1));
-            update_p <<<1,1>>> (d_states, d_count, d_p, G, K);
-            update_tau0 <<<1,1>>> (d_states, d_count, d_p, G, K);
-        }
+        //p and tau0
+        for (int pos=0; pos<2; pos++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_p[pos*n_preserved], &d_p[pos], n_preserved);
         
         //beta
-        propose_beta <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_beta, &d_beta[G], G*(K-1));
-        for (int k=1; k<K; k++){
-            for (int g=0; g<G; g++){
-                fill_prop_beta <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_proposed_beta, d_beta, d_alpha, d_nu, d_delta,
-                                                                                d_phi, d_W, d_X, d_temp_double, g, k, N, G);
-                sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>>(d_temp_double, &d_log_rho[(k-1)*G + g], N);
-            }
-        }
-        update_beta <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_beta, d_log_rho, &d_L[G], &d_beta[G], d_p, G*(K-1));
+        for (int pos=G; pos<G*K; pos++)//starts with G
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_beta[(pos-G)*n_preserved], &d_beta[pos], n_preserved);
         
         //nu
-        propose_nu <<<(G*(B-1)-1)/threads_per_block + 1, threads_per_block>>>(d_states, d_proposed_nu, &d_nu[G], G*(B-1));
-        sample_index = 0;
-        for (int b=1; b<B; b++){
-            sample_index += n_b[b-1];
-            for (int g=0; g<G; g++){
-                fill_prop_nu <<<(n_b[b]-1)/threads_per_block + 1, threads_per_block>>>(d_proposed_nu, d_nu, d_alpha, d_beta, &d_delta[sample_index], d_phi, &d_W[sample_index],
-                                                                                        &d_X[sample_index*G], d_temp_double, b, g, G, n_b[b]);
-                sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[(b-1)*G + g], n_b[b]);
-            }
-        }
-        update_nu <<<(G*(B-1)-1)/threads_per_block+1, threads_per_block>>> (d_states, d_proposed_nu, d_log_rho, &d_nu[G], G, G*(B-1));
+        for (int pos=G; pos<B*G; pos++)//starts with G
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_nu[(pos-G)*n_preserved], &d_nu[pos], n_preserved); 
         
         //delta
-        propose_delta <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_delta, d_delta, N);
-        
-        sample_index = 0;
-        for (int b=0; b<B; b++){
-            for (int i=1; i<n_b[b]; i++){
-                fill_prop_delta <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_proposed_delta, d_delta, d_alpha, d_beta, d_nu, d_phi,
-                                                                                    d_W, d_X, d_temp_double, sample_index+i, G);
-                sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[sample_index+i], G);
-            }
-            sample_index += n_b[b];
-        }
-        update_delta <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_delta, d_log_rho, d_mu_delta, d_delta, N);
+        for (int i=0; i<N; i++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_delta[i*n_preserved], &d_delta[i], n_preserved);
         
         //phi
-        propose_phi <<<(B*G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_phi, d_phi, B*G);
-        sample_index = 0;
-        int bg = 0;
-        for (int b=0; b<B; b++){
-            if(b>0)
-                sample_index += n_b[b-1];
-            for (int g=0; g<G; g++){
-                fill_prop_phi <<<(n_b[b]-1)/threads_per_block + 1, threads_per_block>>> (&d_proposed_phi[bg], &d_phi[bg], &d_alpha[g], &d_beta[g], &d_nu[bg],
-                                                                                        &d_delta[sample_index], &d_W[sample_index], &d_X[sample_index*G + g], d_temp_double, b, G);
-                sum_on_gpu <double> <<<1, threads_per_block , threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[bg], n_b[b]);
-                bg++;
+        for (int pos=0; pos<B*G; pos++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_phi[pos*n_preserved], &d_phi[pos], n_preserved);
+        
+        //W
+        for (int k=0; k<K; k++){
+            for (int i=0; i<N; i++){
+                fill_post_W <<<(n_preserved-1)/threads_per_block + 1, threads_per_block>>> (&d_preserved_W[i*n_preserved], d_temp_int, k, n_preserved);
+                sum_on_gpu <int> <<<1, threads_per_block, threads_per_block*sizeof(int)>>> (d_temp_int, &d_count[k*N + i], n_preserved);
             }
         }
-        update_phi <<<(B*G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_phi, d_log_rho, d_phi, B*G);
-        
-        //w
-        propose_W <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_W, N, K);
-        
-        for (int i=0; i<N; i++){
-            fill_prop_W <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_proposed_W, d_W, d_alpha, d_beta, d_nu, d_delta,
-                                                                            d_phi, d_X, d_temp_double, i, G);
-            sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[i], G);
-        }
-        update_W <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_W, d_log_rho, d_pi, d_W, N, K);
+        mode_on_gpu <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_count, d_W, N, K);
         
         //pi
-        sample_index = 0;
-        for (int b=0; b<B; b++){
-            if(b>0)
-                sample_index += n_b[b-1];
-            for (int k=0; k<K; k++){
-                fill_I_W <<<(n_b[b]-1)/threads_per_block + 1, threads_per_block>>> (&d_W[sample_index], d_temp_int, k, n_b[b]);
-                sum_on_gpu <int> <<<1, threads_per_block, threads_per_block*sizeof(int)>>> (d_temp_int, &d_count[k], n_b[b]);
-            }
-            //Assuming that K is less than 1024.
-            update_pi <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_states, d_count, &d_pi[b*K], K);
-        }
+        for (int pos=0; pos<B*K; pos++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_pi[pos*n_preserved], &d_pi[pos], n_preserved);
         
-        //Store iteration.
-        store_gamma <<<(B*2-1)/threads_per_block + 1, threads_per_block>>> (d_gamma, d_preserved_gamma, iter, n_preserved, B*2);
-        store_alpha <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_alpha, d_preserved_alpha, iter, n_preserved, G);
-        store_L_beta <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>>(&d_L[G], d_preserved_L, &d_beta[G], d_preserved_beta, iter, n_preserved, G*(K-1));
-        cudaMemcpy(&d_preserved_p[iter], &d_p[0], sizeof(double), cudaMemcpyDeviceToDevice);
-        cudaMemcpy(&d_preserved_p[n_preserved + iter], &d_p[1], sizeof(double), cudaMemcpyDeviceToDevice);
-        store_nu_phi <<<(B*G-1)/threads_per_block + 1, threads_per_block>>> (d_nu, d_preserved_nu, d_phi, d_preserved_phi, iter, n_preserved, G, B*G);
-        store_delta_W <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_delta, d_preserved_delta, d_W, d_preserved_W, iter, n_preserved, N);
-        store_pi <<<(B*K-1)/threads_per_block + 1, threads_per_block>>> (d_pi, d_preserved_pi, iter, n_preserved, B*K);
     }
-    
-    //3.Posterior Inference
-    printf("Start posterior inference.\n");
-    //reuse d_{sth} as d_post_{sth}
-    //Z
-    // Not necessary
-    //X
-    // Not necessary either
-    //gamma
-    for (int b=0; b<2*B; b++)
-        mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_gamma[b*n_preserved], &d_gamma[b], n_preserved);
-    
-    //alpha
-    for (int g=0; g<G; g++)
-        mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_alpha[g*n_preserved], &d_alpha[g], n_preserved);
-    
-    //L
-    double* d_post_prob; cudaMalloc(&d_post_prob, G*(K-1)*sizeof(double));
-    for (int pos=0; pos<G*(K-1); pos++)
-        mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(int)>>> (&d_preserved_L[pos*n_preserved], &d_post_prob[pos], n_preserved);
-    
-    //p and tau0
-    for (int pos=0; pos<2; pos++)
-        mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_p[pos*n_preserved], &d_p[pos], n_preserved);
-    
-    //beta
-    for (int pos=G; pos<G*K; pos++)//starts with G
-        mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_beta[(pos-G)*n_preserved], &d_beta[pos], n_preserved);
-    
-    //nu
-    for (int pos=G; pos<B*G; pos++)//starts with G
-        mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_nu[(pos-G)*n_preserved], &d_nu[pos], n_preserved); 
-    
-    //delta
-    for (int i=0; i<N; i++)
-        mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_delta[i*n_preserved], &d_delta[i], n_preserved);
-    
-    //phi
-    for (int pos=0; pos<B*G; pos++)
-        mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_phi[pos*n_preserved], &d_phi[pos], n_preserved);
-    
-    //W
-    for (int k=0; k<K; k++){
-        for (int i=0; i<N; i++){
-            fill_post_W <<<(n_preserved-1)/threads_per_block + 1, threads_per_block>>> (&d_preserved_W[i*n_preserved], d_temp_int, k, n_preserved);
-            sum_on_gpu <int> <<<1, threads_per_block, threads_per_block*sizeof(int)>>> (d_temp_int, &d_count[k*N + i], n_preserved);
+    else{
+        char filename_end[200];
+        for (int printout=0; printout<n_write_disk_times; printout++){
+            for(int iter=0; iter<n_preserved; iter++){
+                
+                //Z and X
+                update_Z_X <<<(N*G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_Y, d_W, d_alpha, d_beta, d_nu,
+                                d_delta, d_gamma, d_phi,
+                                d_Z, d_X, d_batch_dropout, B, N, G);//If there are not enough threads, may have to separate Z and X.
+            
+                // gamma
+                propose_gamma <<<(B-1)/threads_per_block + 1, threads_per_block>>>(d_states, d_proposed_gamma, d_gamma, d_batch_dropout, B);
+                
+                //Fill gamma0
+                sample_index = 0;
+                for (int b=0; b<B; b++){
+                    if (b>0)
+                        sample_index += n_b[b-1];
+                    if (batch_dropout[b]){
+                        fill_prop_gamma0 <<<(n_b[b]*G-1)/threads_per_block+1, threads_per_block>>> (d_proposed_gamma, d_gamma, &d_Z[sample_index*G],
+                                                                                                    &d_X[sample_index*G], d_temp_double, b, B, n_b[b]*G);
+                        sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[b], n_b[b]*G);
+                    }
+                }
+                update_gamma0 <<< (B-1)/threads_per_block + 1, threads_per_block >>> (d_states, d_proposed_gamma, d_log_rho, d_batch_dropout, d_gamma, B);
+                
+                //Fill gamma1
+                sample_index = 0;
+                for (int b=0; b<B; b++){
+                    if (b>0)
+                        sample_index += n_b[b-1];
+                    if (batch_dropout[b]){
+                        fill_prop_gamma1 <<<(n_b[b]*G-1)/threads_per_block+1, threads_per_block>>> (d_proposed_gamma, d_gamma, &d_Z[sample_index*G],
+                                                                                                    &d_X[sample_index*G], d_temp_double, b, B, n_b[b]*G);
+                        sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[b], n_b[b]*G);
+                    }
+                }
+                update_gamma1 <<< (B-1)/threads_per_block + 1, threads_per_block >>> (d_states, d_proposed_gamma, d_log_rho, d_batch_dropout, d_gamma, B);
+                
+                //alpha
+                propose_alpha <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_alpha, d_alpha, G);
+                
+                for (int g=0; g<G; g++){
+                    fill_prop_alpha <<< (N-1)/threads_per_block + 1, threads_per_block >>>(d_proposed_alpha, d_alpha, d_beta, d_nu, d_delta, d_phi,
+                                                                                        d_W, d_X, d_temp_double, g, B, N, G);
+                    sum_on_gpu <double> <<< 1, threads_per_block, threads_per_block*sizeof(double) >>>(d_temp_double, &d_log_rho[g], N);
+                }
+                update_alpha <<< (G-1)/threads_per_block + 1, threads_per_block >>>(d_states, d_proposed_alpha, d_log_rho, d_mu_alpha, d_alpha, G);
+                
+                //L
+                update_L <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_p, &d_beta[G], &d_L[G], G*(K-1));
+                
+                //p
+                if(iter >= n_unchanged - n_burnin){
+                    //Fill d_count[0] with sum of d_L and d_p[1] with sum of I(d_L==0)*d_beta^2
+                    //I used d_p[1] to carry the second sum. Its value will be replaced anyway.
+                    sum_on_gpu <int> <<<1, threads_per_block, threads_per_block*sizeof(int)>>> (&d_L[G], &d_count[0], G*(K-1));
+                    fill_I_L_beta_sq <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>> (&d_L[G], &d_beta[G], d_temp_double, G*(K-1));
+                    sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_p[1], G*(K-1));
+                    update_p <<<1,1>>> (d_states, d_count, d_p, G, K);
+                    update_tau0 <<<1,1>>> (d_states, d_count, d_p, G, K);
+                }
+                
+                //beta
+                propose_beta <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_beta, &d_beta[G], G*(K-1));
+                for (int k=1; k<K; k++){
+                    for (int g=0; g<G; g++){
+                        fill_prop_beta <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_proposed_beta, d_beta, d_alpha, d_nu, d_delta,
+                                                                                        d_phi, d_W, d_X, d_temp_double, g, k, N, G);
+                        sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>>(d_temp_double, &d_log_rho[(k-1)*G + g], N);
+                    }
+                }
+                update_beta <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_beta, d_log_rho, &d_L[G], &d_beta[G], d_p, G*(K-1));
+                
+                //nu
+                propose_nu <<<(G*(B-1)-1)/threads_per_block + 1, threads_per_block>>>(d_states, d_proposed_nu, &d_nu[G], G*(B-1));
+                sample_index = 0;
+                for (int b=1; b<B; b++){
+                    sample_index += n_b[b-1];
+                    for (int g=0; g<G; g++){
+                        fill_prop_nu <<<(n_b[b]-1)/threads_per_block + 1, threads_per_block>>>(d_proposed_nu, d_nu, d_alpha, d_beta, &d_delta[sample_index], d_phi, &d_W[sample_index],
+                                                                                                &d_X[sample_index*G], d_temp_double, b, g, G, n_b[b]);
+                        sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[(b-1)*G + g], n_b[b]);
+                    }
+                }
+                update_nu <<<(G*(B-1)-1)/threads_per_block+1, threads_per_block>>> (d_states, d_proposed_nu, d_log_rho, &d_nu[G], G, G*(B-1));
+                
+                //delta
+                propose_delta <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_delta, d_delta, N);
+                
+                sample_index = 0;
+                for (int b=0; b<B; b++){
+                    for (int i=1; i<n_b[b]; i++){
+                        fill_prop_delta <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_proposed_delta, d_delta, d_alpha, d_beta, d_nu, d_phi,
+                                                                                            d_W, d_X, d_temp_double, sample_index+i, G);
+                        sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[sample_index+i], G);
+                    }
+                    sample_index += n_b[b];
+                }
+                update_delta <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_delta, d_log_rho, d_mu_delta, d_delta, N);
+                
+                //phi
+                propose_phi <<<(B*G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_phi, d_phi, B*G);
+                sample_index = 0;
+                int bg = 0;
+                for (int b=0; b<B; b++){
+                    if(b>0)
+                        sample_index += n_b[b-1];
+                    for (int g=0; g<G; g++){
+                        fill_prop_phi <<<(n_b[b]-1)/threads_per_block + 1, threads_per_block>>> (&d_proposed_phi[bg], &d_phi[bg], &d_alpha[g], &d_beta[g], &d_nu[bg],
+                                                                                                &d_delta[sample_index], &d_W[sample_index], &d_X[sample_index*G + g], d_temp_double, b, G);
+                        sum_on_gpu <double> <<<1, threads_per_block , threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[bg], n_b[b]);
+                        bg++;
+                    }
+                }
+                update_phi <<<(B*G-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_phi, d_log_rho, d_phi, B*G);
+                
+                //w
+                propose_W <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_W, N, K);
+                
+                for (int i=0; i<N; i++){
+                    fill_prop_W <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_proposed_W, d_W, d_alpha, d_beta, d_nu, d_delta,
+                                                                                    d_phi, d_X, d_temp_double, i, G);
+                    sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_temp_double, &d_log_rho[i], G);
+                }
+                update_W <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_states, d_proposed_W, d_log_rho, d_pi, d_W, N, K);
+                
+                //pi
+                sample_index = 0;
+                for (int b=0; b<B; b++){
+                    if(b>0)
+                        sample_index += n_b[b-1];
+                    for (int k=0; k<K; k++){
+                        fill_I_W <<<(n_b[b]-1)/threads_per_block + 1, threads_per_block>>> (&d_W[sample_index], d_temp_int, k, n_b[b]);
+                        sum_on_gpu <int> <<<1, threads_per_block, threads_per_block*sizeof(int)>>> (d_temp_int, &d_count[k], n_b[b]);
+                    }
+                    //Assuming that K is less than 1024.
+                    update_pi <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (d_states, d_count, &d_pi[b*K], K);
+                }
+                
+                //Store iteration.
+                store_gamma <<<(B*2-1)/threads_per_block + 1, threads_per_block>>> (d_gamma, d_preserved_gamma, iter, n_preserved, B*2);
+                store_alpha <<<(G-1)/threads_per_block + 1, threads_per_block>>> (d_alpha, d_preserved_alpha, iter, n_preserved, G);
+                store_L_beta <<<(G*(K-1)-1)/threads_per_block + 1, threads_per_block>>>(&d_L[G], d_preserved_L, &d_beta[G], d_preserved_beta, iter, n_preserved, G*(K-1));
+                cudaMemcpy(&d_preserved_p[iter], &d_p[0], sizeof(double), cudaMemcpyDeviceToDevice);
+                cudaMemcpy(&d_preserved_p[n_preserved + iter], &d_p[1], sizeof(double), cudaMemcpyDeviceToDevice);
+                store_nu_phi <<<(B*G-1)/threads_per_block + 1, threads_per_block>>> (d_nu, d_preserved_nu, d_phi, d_preserved_phi, iter, n_preserved, G, B*G);
+                store_delta_W <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_delta, d_preserved_delta, d_W, d_preserved_W, iter, n_preserved, N);
+                store_pi <<<(B*K-1)/threads_per_block + 1, threads_per_block>>> (d_pi, d_preserved_pi, iter, n_preserved, B*K);
+            }
+            if (printout<n_write_disk_times-1){
+                sprintf(filename_end, "_%d.txt", printout);
+                //gamma
+                double* h_temp_gamma = (double*)malloc(2*B*n_preserved*sizeof(double));
+                cudaMemcpy(h_temp_gamma, d_preserved_gamma, 2*B*n_preserved*sizeof(double), cudaMemcpyDeviceToHost);
+                char gamma_temp_filename[200];
+                strcpy(gamma_temp_filename, output_file);
+                strcat(gamma_temp_filename, "_temp_gamma");
+                strcat(gamma_temp_filename, filename_end);
+                FILE *gamma_temp_file;
+                gamma_temp_file = fopen(gamma_temp_filename,"w");
+                
+                for (int pos=0; pos<2*B; pos++){
+                    for (int iter=0; iter<n_preserved-1; iter++)
+                        fprintf(gamma_temp_file, "%lf\t", h_temp_gamma[pos*n_preserved + iter]);
+                    fprintf(gamma_temp_file, "%lf\n", h_temp_gamma[pos*n_preserved + (n_preserved-1)]);
+                }
+                fclose(gamma_temp_file);
+                free(h_temp_gamma);
+                
+                //alpha
+                double* h_temp_alpha = (double*)malloc(G*n_preserved*sizeof(double));
+                cudaMemcpy(h_temp_alpha, d_preserved_alpha, G*n_preserved*sizeof(double), cudaMemcpyDeviceToHost);
+                char alpha_temp_filename[200];
+                strcpy(alpha_temp_filename, output_file);
+                strcat(alpha_temp_filename, "_temp_alpha");
+                strcat(alpha_temp_filename, filename_end);
+                FILE *alpha_temp_file;
+                alpha_temp_file = fopen(alpha_temp_filename,"w");
+                
+                for (int g=0; g<G; g++){
+                    for (int iter=0; iter<n_preserved-1; iter++)
+                        fprintf(alpha_temp_file, "%lf\t", h_temp_alpha[g*n_preserved + iter]);
+                    fprintf(alpha_temp_file, "%lf\n", h_temp_alpha[g*n_preserved + (n_preserved-1)]);
+                }
+                fclose(alpha_temp_file);
+                free(h_temp_alpha);
+                
+                //L
+                int* h_temp_L = (int*)malloc(G*(K-1)*n_preserved*sizeof(int));
+                cudaMemcpy(h_temp_L, d_preserved_L, G*(K-1)*n_preserved*sizeof(int), cudaMemcpyDeviceToHost);
+                char L_temp_filename[200];
+                strcpy(L_temp_filename, output_file);
+                strcat(L_temp_filename, "_temp_L");
+                strcat(L_temp_filename, filename_end);
+                FILE *L_temp_file;
+                L_temp_file = fopen(L_temp_filename,"w");
+                
+                for (int pos=0; pos<(K-1)*G; pos++){
+                    for (int iter=0; iter<n_preserved-1; iter++)
+                        fprintf(L_temp_file, "%d\t", h_temp_L[pos*n_preserved + iter]);
+                    fprintf(L_temp_file, "%d\n", h_temp_L[pos*n_preserved + (n_preserved-1)]);
+                }
+                fclose(L_temp_file);
+                free(h_temp_L);
+                
+                //beta
+                double* h_temp_beta = (double*)malloc(G*(K-1)*n_preserved*sizeof(double));
+                cudaMemcpy(h_temp_beta, d_preserved_beta, G*(K-1)*n_preserved*sizeof(double), cudaMemcpyDeviceToHost);
+                char beta_temp_filename[200];
+                strcpy(beta_temp_filename, output_file);
+                strcat(beta_temp_filename, "_temp_beta");
+                strcat(beta_temp_filename, filename_end);
+                FILE *beta_temp_file;
+                beta_temp_file = fopen(beta_temp_filename,"w");
+                
+                for (int pos=0; pos<G*(K-1); pos++){
+                    for (int iter=0; iter<n_preserved-1; iter++)
+                        fprintf(beta_temp_file, "%lf\t", h_temp_beta[pos*n_preserved + iter]);
+                    fprintf(beta_temp_file, "%lf\n", h_temp_beta[pos*n_preserved + (n_preserved-1)]);
+                }
+                fclose(beta_temp_file);
+                free(h_temp_beta);
+                
+                //p and tau0
+                double* h_temp_p = (double*)malloc(2*n_preserved*sizeof(double));
+                cudaMemcpy(h_temp_p, d_preserved_p, 2*n_preserved*sizeof(double), cudaMemcpyDeviceToHost);
+                char p_temp_filename[200];
+                strcpy(p_temp_filename, output_file);
+                strcat(p_temp_filename, "_temp_p");
+                strcat(p_temp_filename, filename_end);
+                FILE *p_temp_file;
+                p_temp_file = fopen(p_temp_filename,"w");
+                
+                for (int i=0; i<2; i++){
+                    for (int iter=0; iter<n_preserved-1; iter++)
+                        fprintf(p_temp_file, "%lf\t", h_temp_p[i*n_preserved + iter]);
+                    fprintf(p_temp_file, "%lf\n", h_temp_p[i*n_preserved + (n_preserved-1)]);
+                }
+                fclose(p_temp_file);
+                free(h_temp_p);
+                
+                //nu
+                double* h_temp_nu = (double*)malloc(G*(B-1)*n_preserved*sizeof(double));
+                cudaMemcpy(h_temp_nu, d_preserved_nu, G*(B-1)*n_preserved*sizeof(double), cudaMemcpyDeviceToHost);
+                char nu_temp_filename[200];
+                strcpy(nu_temp_filename, output_file);
+                strcat(nu_temp_filename, "_temp_nu");
+                strcat(nu_temp_filename, filename_end);
+                FILE *nu_temp_file;
+                nu_temp_file = fopen(nu_temp_filename,"w");
+                
+                for (int pos=0; pos<(B-1)*G; pos++){
+                    for (int iter=0; iter<n_preserved-1; iter++)
+                        fprintf(nu_temp_file, "%lf\t", h_temp_nu[pos*n_preserved + iter]);
+                    fprintf(nu_temp_file, "%lf\n", h_temp_nu[pos*n_preserved + (n_preserved-1)]);
+                }
+                fclose(nu_temp_file);
+                free(h_temp_nu);
+                
+                //delta
+                double* h_temp_delta = (double*)malloc(N*n_preserved*sizeof(double));
+                cudaMemcpy(h_temp_delta, d_preserved_delta, N*n_preserved*sizeof(double), cudaMemcpyDeviceToHost);
+                char delta_temp_filename[200];
+                strcpy(delta_temp_filename, output_file);
+                strcat(delta_temp_filename, "_temp_delta");
+                strcat(delta_temp_filename, filename_end);
+                FILE *delta_temp_file;
+                delta_temp_file = fopen(delta_temp_filename,"w");
+
+                for (int i=0; i<N; i++){
+                    for (int iter=0; iter<n_preserved-1; iter++)
+                        fprintf(delta_temp_file, "%lf\t", h_temp_delta[i*n_preserved + iter]);
+                    fprintf(delta_temp_file, "%lf\n", h_temp_delta[i*n_preserved + (n_preserved-1)]);
+                }
+                fclose(delta_temp_file);
+                free(h_temp_delta);
+                
+                //phi
+                double* h_temp_phi = (double*)malloc(G*B*n_preserved*sizeof(double));
+                cudaMemcpy(h_temp_phi, d_preserved_phi, G*B*n_preserved*sizeof(double), cudaMemcpyDeviceToHost);
+                char phi_temp_filename[200];
+                strcpy(phi_temp_filename, output_file);
+                strcat(phi_temp_filename, "_temp_phi");
+                strcat(phi_temp_filename, filename_end);
+                FILE *phi_temp_file;
+                phi_temp_file = fopen(phi_temp_filename,"w");
+                
+                for (int pos=0; pos<B*G; pos++){
+                    for (int iter=0; iter<n_preserved-1; iter++)
+                        fprintf(phi_temp_file, "%lf\t", h_temp_phi[pos*n_preserved + iter]);
+                    fprintf(phi_temp_file, "%lf\n", h_temp_phi[pos*n_preserved + (n_preserved-1)]);
+                }
+                fclose(phi_temp_file);
+                free(h_temp_phi);
+                
+                //W
+                int* h_temp_W = (int*)malloc(N*n_preserved*sizeof(int));
+                cudaMemcpy(h_temp_W, d_preserved_W, N*n_preserved*sizeof(int), cudaMemcpyDeviceToHost);
+                char W_temp_filename[200];
+                strcpy(W_temp_filename, output_file);
+                strcat(W_temp_filename, "_temp_W");
+                strcat(W_temp_filename, filename_end);
+                FILE *W_temp_file;
+                W_temp_file = fopen(W_temp_filename,"w");
+
+                for (int i=0; i<N; i++){
+                    for (int iter=0; iter<n_preserved-1; iter++)
+                        fprintf(W_temp_file, "%d\t", h_temp_W[i*n_preserved + iter]);
+                    fprintf(W_temp_file, "%d\n", h_temp_W[i*n_preserved + (n_preserved-1)]);
+                }
+                fclose(W_temp_file);
+                free(h_temp_W);
+                
+                //pi
+                double* h_temp_pi = (double*)malloc(B*K*n_preserved*sizeof(double));
+                cudaMemcpy(h_temp_pi, d_preserved_pi, B*K*n_preserved*sizeof(double), cudaMemcpyDeviceToHost);
+                char pi_temp_filename[200];
+                strcpy(pi_temp_filename, output_file);
+                strcat(pi_temp_filename, "_temp_pi");
+                strcat(pi_temp_filename, filename_end);
+                FILE *pi_temp_file;
+                pi_temp_file = fopen(pi_temp_filename,"w");
+                
+                for (int pos=0; pos<B*K; pos++){
+                    for (int iter=0; iter<n_preserved-1; iter++)
+                        fprintf(pi_temp_file, "%lf\t", h_temp_pi[pos*n_preserved + iter]);
+                    fprintf(pi_temp_file, "%lf\n", h_temp_pi[pos*n_preserved + (n_preserved-1)]);
+                }
+                fclose(pi_temp_file);
+                free(h_temp_pi);
+            }
         }
+        //3.Posterior Inference
+        printf("Start posterior inference.\n");
+        //reuse d_{sth} as d_post_{sth}
+        //Z
+        // Not necessary
+        //X
+        // Not necessary either
+        //gamma
+        double* h_temp_gamma = (double*)malloc(2*B*n_preserved*sizeof(double));
+        for (int printout = n_write_disk_times-1; printout>=0; printout--){
+            if (printout < n_write_disk_times - 1){
+                sprintf(filename_end, "_%d.txt", printout);
+                char gamma_temp_filename[200];
+                strcpy(gamma_temp_filename, output_file);
+                strcat(gamma_temp_filename, "_temp_gamma");
+                strcat(gamma_temp_filename, filename_end);
+                FILE* gamma_temp_file;
+                gamma_temp_file = fopen(gamma_temp_filename,"r");
+                for (int pos=0; pos<2*B*n_preserved; pos++)
+                    fscanf(gamma_temp_file,"%lf",&h_temp_gamma[pos]);
+                fclose(gamma_temp_file);
+                cudaMemcpy(d_preserved_gamma, h_temp_gamma, 2*B*n_preserved*sizeof(double), cudaMemcpyHostToDevice);
+            }
+            for (int b=0; b<2*B; b++){
+                mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_gamma[b*n_preserved], &d_temp_double[b*n_write_disk_times+printout], n_preserved);
+            }
+        }
+        free(h_temp_gamma);
+        for (int b=0; b<2*B; b++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_temp_double[b*n_write_disk_times], &d_gamma[b], n_write_disk_times);
+        
+        //alpha
+        double* h_temp_alpha = (double*)malloc(G*n_preserved*sizeof(double));
+        for (int printout = n_write_disk_times-1; printout>=0; printout--){
+            if (printout < n_write_disk_times - 1){
+                sprintf(filename_end, "_%d.txt", printout);
+                char alpha_temp_filename[200];
+                strcpy(alpha_temp_filename, output_file);
+                strcat(alpha_temp_filename, "_temp_alpha");
+                strcat(alpha_temp_filename, filename_end);
+                FILE* alpha_temp_file;
+                alpha_temp_file = fopen(alpha_temp_filename,"r");
+                for (int pos=0; pos<G*n_preserved; pos++)
+                    fscanf(alpha_temp_file,"%lf",&h_temp_alpha[pos]);
+                fclose(alpha_temp_file);
+                cudaMemcpy(d_preserved_alpha, h_temp_alpha, G*n_preserved*sizeof(double), cudaMemcpyHostToDevice);
+            }
+            for (int g=0; g<G; g++){
+                mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_alpha[g*n_preserved], &d_temp_double[g*n_write_disk_times+printout], n_preserved);
+            }
+        }
+        free(h_temp_alpha);
+        for (int g=0; g<G; g++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_temp_double[g*n_write_disk_times], &d_alpha[g], n_write_disk_times);
+        
+        //L
+        int* h_temp_L = (int*)malloc(G*(K-1)*n_preserved*sizeof(int));
+        for (int printout = n_write_disk_times-1; printout>=0; printout--){
+            if (printout < n_write_disk_times - 1){
+                sprintf(filename_end, "_%d.txt", printout);
+                char L_temp_filename[200];
+                strcpy(L_temp_filename, output_file);
+                strcat(L_temp_filename, "_temp_L");
+                strcat(L_temp_filename, filename_end);
+                FILE* L_temp_file;
+                L_temp_file = fopen(L_temp_filename,"r");
+                for (int pos=0; pos<G*(K-1)*n_preserved; pos++)
+                    fscanf(L_temp_file,"%d",&h_temp_L[pos]);
+                fclose(L_temp_file);
+                cudaMemcpy(d_preserved_L, h_temp_L, G*(K-1)*n_preserved*sizeof(int), cudaMemcpyHostToDevice);
+            }
+            for (int pos=0; pos<G*(K-1); pos++){
+                mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(int)>>> (&d_preserved_L[pos*n_preserved], &d_temp_double[pos*n_write_disk_times+printout], n_preserved);
+            }
+        }
+        free(h_temp_L);
+        for (int pos=0; pos<G*(K-1); pos++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_temp_double[pos*n_write_disk_times], &d_post_prob[pos], n_write_disk_times);
+        
+        //p and tau0
+        double* h_temp_p = (double*)malloc(2*n_preserved*sizeof(double));
+        for (int printout = n_write_disk_times-1; printout>=0; printout--){
+            if (printout < n_write_disk_times - 1){
+                sprintf(filename_end, "_%d.txt", printout);
+                char p_temp_filename[200];
+                strcpy(p_temp_filename, output_file);
+                strcat(p_temp_filename, "_temp_p");
+                strcat(p_temp_filename, filename_end);
+                FILE* p_temp_file;
+                p_temp_file = fopen(p_temp_filename,"r");
+                for (int pos=0; pos<2*n_preserved; pos++)
+                    fscanf(p_temp_file,"%lf",&h_temp_p[pos]);
+                fclose(p_temp_file);
+                cudaMemcpy(d_preserved_p, h_temp_p, 2*n_preserved*sizeof(double), cudaMemcpyHostToDevice);
+            }
+            for (int pos=0; pos<2; pos++){
+                mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_p[pos*n_preserved], &d_temp_double[pos*n_write_disk_times+printout], n_preserved);
+            }
+        }
+        free(h_temp_p);
+        for (int pos=0; pos<2; pos++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_temp_double[pos*n_write_disk_times], &d_p[pos], n_write_disk_times);
+        
+        //beta
+        double* h_temp_beta = (double*)malloc(G*(K-1)*n_preserved*sizeof(double));
+        for (int printout = n_write_disk_times-1; printout>=0; printout--){
+            if (printout < n_write_disk_times - 1){
+                sprintf(filename_end, "_%d.txt", printout);
+                char beta_temp_filename[200];
+                strcpy(beta_temp_filename, output_file);
+                strcat(beta_temp_filename, "_temp_beta");
+                strcat(beta_temp_filename, filename_end);
+                FILE* beta_temp_file;
+                beta_temp_file = fopen(beta_temp_filename,"r");
+                for (int pos=0; pos<G*(K-1)*n_preserved; pos++)
+                    fscanf(beta_temp_file,"%lf",&h_temp_beta[pos]);
+                fclose(beta_temp_file);
+                cudaMemcpy(d_preserved_beta, h_temp_beta, G*(K-1)*n_preserved*sizeof(double), cudaMemcpyHostToDevice);
+            }
+            for (int pos=0; pos<G*(K-1); pos++){
+                mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_beta[pos*n_preserved], &d_temp_double[pos*n_write_disk_times+printout], n_preserved);
+            }
+        }
+        free(h_temp_beta);
+        for (int pos=0; pos<G*(K-1); pos++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_temp_double[pos*n_write_disk_times], &d_beta[pos+G], n_write_disk_times);
+        
+        //nu
+        double* h_temp_nu = (double*)malloc((B-1)*G*n_preserved*sizeof(double));
+        for (int printout = n_write_disk_times-1; printout>=0; printout--){
+            if (printout < n_write_disk_times - 1){
+                sprintf(filename_end, "_%d.txt", printout);
+                char nu_temp_filename[200];
+                strcpy(nu_temp_filename, output_file);
+                strcat(nu_temp_filename, "_temp_nu");
+                strcat(nu_temp_filename, filename_end);
+                FILE* nu_temp_file;
+                nu_temp_file = fopen(nu_temp_filename,"r");
+                for (int pos=0; pos<(B-1)*G*n_preserved; pos++)
+                    fscanf(nu_temp_file,"%lf",&h_temp_nu[pos]);
+                fclose(nu_temp_file);
+                cudaMemcpy(d_preserved_nu, h_temp_nu, (B-1)*G*n_preserved*sizeof(double), cudaMemcpyHostToDevice);
+            }
+            for (int pos=0; pos<(B-1)*G; pos++){
+                mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_nu[pos*n_preserved], &d_temp_double[pos*n_write_disk_times+printout], n_preserved);
+            }
+        }
+        free(h_temp_nu);
+        for (int pos=0; pos<(B-1)*G; pos++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_temp_double[pos*n_write_disk_times], &d_nu[pos+G], n_write_disk_times);
+        
+        //delta
+        double* h_temp_delta = (double*)malloc(N*n_preserved*sizeof(double));
+        for (int printout = n_write_disk_times-1; printout>=0; printout--){
+            if (printout < n_write_disk_times - 1){
+                sprintf(filename_end, "_%d.txt", printout);
+                char delta_temp_filename[200];
+                strcpy(delta_temp_filename, output_file);
+                strcat(delta_temp_filename, "_temp_delta");
+                strcat(delta_temp_filename, filename_end);
+                FILE* delta_temp_file;
+                delta_temp_file = fopen(delta_temp_filename,"r");
+                for (int pos=0; pos<N*n_preserved; pos++)
+                    fscanf(delta_temp_file,"%lf",&h_temp_delta[pos]);
+                fclose(delta_temp_file);
+                cudaMemcpy(d_preserved_delta, h_temp_delta, N*n_preserved*sizeof(double), cudaMemcpyHostToDevice);
+            }
+            for (int i=0; i<N; i++){
+                mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_delta[i*n_preserved], &d_temp_double[i*n_write_disk_times+printout], n_preserved);
+            }
+        }
+        free(h_temp_delta);
+        for (int i=0; i<N; i++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_temp_double[i*n_write_disk_times], &d_delta[i], n_write_disk_times);
+        
+        //phi
+        double* h_temp_phi = (double*)malloc(B*G*n_preserved*sizeof(double));
+        for (int printout = n_write_disk_times-1; printout>=0; printout--){
+            if (printout < n_write_disk_times - 1){
+                sprintf(filename_end, "_%d.txt", printout);
+                char phi_temp_filename[200];
+                strcpy(phi_temp_filename, output_file);
+                strcat(phi_temp_filename, "_temp_phi");
+                strcat(phi_temp_filename, filename_end);
+                FILE* phi_temp_file;
+                phi_temp_file = fopen(phi_temp_filename,"r");
+                for (int pos=0; pos<B*G*n_preserved; pos++)
+                    fscanf(phi_temp_file,"%lf",&h_temp_phi[pos]);
+                fclose(phi_temp_file);
+                cudaMemcpy(d_preserved_phi, h_temp_phi, B*G*n_preserved*sizeof(double), cudaMemcpyHostToDevice);
+            }
+            for (int pos=0; pos<B*G; pos++){
+                mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_phi[pos*n_preserved], &d_temp_double[pos*n_write_disk_times+printout], n_preserved);
+            }
+        }
+        free(h_temp_phi);
+        for (int pos=0; pos<B*G; pos++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_temp_double[pos*n_write_disk_times], &d_phi[pos], n_write_disk_times);
+        
+        //W
+        int* h_temp_W = (int*)malloc(N*n_preserved*sizeof(int));
+        for (int printout = n_write_disk_times-1; printout>=0; printout--){
+            if (printout < n_write_disk_times - 1){
+                sprintf(filename_end, "_%d.txt", printout);
+                char W_temp_filename[200];
+                strcpy(W_temp_filename, output_file);
+                strcat(W_temp_filename, "_temp_W");
+                strcat(W_temp_filename, filename_end);
+                FILE* W_temp_file;
+                W_temp_file = fopen(W_temp_filename,"r");
+                for (int pos=0; pos<N*n_preserved; pos++)
+                    fscanf(W_temp_file,"%d",&h_temp_W[pos]);
+                fclose(W_temp_file);
+                cudaMemcpy(d_preserved_W, h_temp_W, N*n_preserved*sizeof(int), cudaMemcpyHostToDevice);
+            }
+            for (int k=0; k<K; k++){
+                for (int i=0; i<N; i++){
+                    fill_post_W <<<(n_preserved-1)/threads_per_block + 1, threads_per_block>>> (&d_preserved_W[i*n_preserved], d_temp_int, k, n_preserved);
+                    sum_on_gpu <int> <<<1, threads_per_block, threads_per_block*sizeof(int)>>> (d_temp_int, &d_count[(k*N + i)*n_write_disk_times+printout], n_preserved);
+                }
+            }
+        }
+        free(h_temp_W);
+        for (int k=0; k<K; k++){
+            for (int i=0; i<N; i++){
+                sum_on_gpu <int> <<<1, threads_per_block, threads_per_block*sizeof(int)>>> (&d_count[(k*N + i)*n_write_disk_times], &d_count[k*N + i], n_write_disk_times);
+            }
+        }
+        mode_on_gpu <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_count, d_W, N, K);
+        
+        //pi
+        double* h_temp_pi = (double*)malloc(B*K*n_preserved*sizeof(double));
+        for (int printout = n_write_disk_times-1; printout>=0; printout--){
+            if (printout < n_write_disk_times - 1){
+                sprintf(filename_end, "_%d.txt", printout);
+                char pi_temp_filename[200];
+                strcpy(pi_temp_filename, output_file);
+                strcat(pi_temp_filename, "_temp_pi");
+                strcat(pi_temp_filename, filename_end);
+                FILE* pi_temp_file;
+                pi_temp_file = fopen(pi_temp_filename,"r");
+                for (int pos=0; pos<B*K*n_preserved; pos++)
+                    fscanf(pi_temp_file,"%lf",&h_temp_pi[pos]);
+                fclose(pi_temp_file);
+                cudaMemcpy(d_preserved_pi, h_temp_pi, B*K*n_preserved*sizeof(double), cudaMemcpyHostToDevice);
+            }
+            for (int pos=0; pos<B*K; pos++){
+                mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_pi[pos*n_preserved], &d_temp_double[pos*n_write_disk_times+printout], n_preserved);
+            }
+        }
+        free(h_temp_pi);
+        for (int pos=0; pos<B*K; pos++)
+            mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_temp_double[pos*n_write_disk_times], &d_pi[pos], n_write_disk_times);
     }
-    mode_on_gpu <<<(N-1)/threads_per_block + 1, threads_per_block>>> (d_count, d_W, N, K);
-    
-    //pi
-    for (int pos=0; pos<B*K; pos++)
-        mean_on_gpu <<<1, threads_per_block, threads_per_block*sizeof(double)>>> (&d_preserved_pi[pos*n_preserved], &d_pi[pos], n_preserved);
     
     //4.Write output
     printf("Start writing output files.\n");
@@ -1819,7 +2476,7 @@ int main(int argc, char **argv){
         for (int i=0; i<n_b[b]; i++){
             for (int k=0; k<K; k++){
                 fill_log_likelihood_1<<<(G-1)/threads_per_block + 1, threads_per_block>>>(d_alpha, &d_beta[k*G], &d_nu[b*G], &d_delta[sample_index+i],
-                                        &d_gamma[b], &d_gamma[B+b], &d_phi[b*G], &d_Y[(sample_index+i)*G], d_temp_double, G);
+                                        &d_gamma[b], &d_gamma[B+b], &d_phi[b*G], &d_Y[(sample_index+i)*G], batch_dropout[b], d_temp_double, G);
                 sum_on_gpu <double> <<<1, threads_per_block, threads_per_block*sizeof(double)>>>(d_temp_double, &d_log_likelihood_partial[k*N + sample_index + i], G);
             }
         }
@@ -1843,7 +2500,7 @@ int main(int argc, char **argv){
     fclose(BIC_output_file);
     
     //(Optional) Print out all preserved iterations.
-    if (print_preserved){
+    if (print_preserved && !boo_write_disk){
         printf("Start writing preserved iterations.\n");
         
         //gamma
