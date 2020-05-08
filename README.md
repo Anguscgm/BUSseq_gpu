@@ -21,9 +21,9 @@ The code can be run on a gpu with the following lines.
 Once compiled, the executable file can be run with different arguments without the need of compiling again.
 ```
 # Compile the CUDA code
-    nvcc ./gpu_busseq_optional_dropout.cu -o ./gpu_busseq_optional_dropout --compiler-options -Wall
+    nvcc ./BUSseq_gpu_optional_dropout.cu -o ./BUSseq_gpu_optional_dropout --compiler-options -Wall
 # Actually running!
-    ./gpu_busseq_optional_dropout -B 4 -N ./count_data/demo_dim.txt -G 3000 -K 5 -s 13579 \
+    ./BUSseq_gpu_optional_dropout -B 4 -N ./count_data/demo_dim.txt -G 3000 -K 5 -s 13579 \
         -c ./count_data/demo_count.txt -i 4000 -b 2000 -u 500 -w 1000 \
         -d ./count_data/demo_dropout.txt -o demo_output
 ```
@@ -84,7 +84,7 @@ Please note that:
 The following will demonstrate how to perform BUSseq_gpu on simulation and real datasets.
 ### Simulation
 ```
-/gpu_busseq_optional_dropout -B 4 -N ./count_data/simulation_dim.txt -G 3000 -K 5 -s 13579 \
+/BUSseq_gpu_optional_dropout -B 4 -N ./count_data/simulation_dim.txt -G 3000 -K 5 -s 13579 \
         -c ./count_data/simulation_count.txt -i 4000 -b 2000 -u 500 \
         -d ./count_data/simulation_dropout.txt -o simulation_output
 ```
